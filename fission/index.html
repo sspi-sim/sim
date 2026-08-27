@@ -55,9 +55,7 @@
     flex-direction: column;
     gap: 6px;
     padding: 10px 20px 10px;
-    background: var(--ui-bg);
-    backdrop-filter: blur(18px);
-    -webkit-backdrop-filter: blur(18px);
+    background: rgba(8,6,24,0.82);
     box-shadow: 0 4px 24px rgba(0,0,0,0.55);
   }
 
@@ -548,9 +546,7 @@
     z-index: 10;
     display: none;
     flex-direction: row;
-    background: var(--ui-bg);
-    backdrop-filter: blur(18px);
-    -webkit-backdrop-filter: blur(18px);
+    background: rgba(8,6,24,0.82);
     border-top: 1px solid var(--ui-border);
     box-shadow: 0 -1px 0 var(--accent1-dim), 0 -4px 20px rgba(0,0,0,0.5);
   }
@@ -838,11 +834,9 @@
     border-radius: 12px;
     width: 353px;
     height: 256px;
-    background: rgba(8,6,24,0.90);
+    background: rgba(8,6,24,0.95);
     border: 1px solid var(--accent2);
     z-index: 15;
-    backdrop-filter: blur(10px);
-    -webkit-backdrop-filter: blur(10px);
     padding: 10px 10px 8px;
     box-shadow: 0 0 24px var(--accent2-dim);
     cursor: grab;
@@ -2814,6 +2808,7 @@ function drawSpeedLines() {
 const neutronIconJitter = { x: 0, y: 0 };
 let _neutronIconRAF = null;
 let _neutronIconLast = -67;
+let _neutronIconEnergy = 1.0;
 
 function drawNeutronIconToCanvas(canvas) {
   if (!canvas) return;
@@ -2851,11 +2846,13 @@ function drawNeutronIcon() {
 function neutronIconLoop(now) {
   if (now - _neutronIconLast >= 67) {
     _neutronIconLast = now;
+    _neutronIconEnergy *= 0.78;
     neutronIconJitter.x += (Math.random() - 0.5) * 0.7;
     neutronIconJitter.y += (Math.random() - 0.5) * 0.7;
     neutronIconJitter.x *= 0.78;
     neutronIconJitter.y *= 0.78;
     drawNeutronIcon();
+    if (_neutronIconEnergy < 0.01) { _neutronIconRAF = null; return; }
   }
   _neutronIconRAF = requestAnimationFrame(neutronIconLoop);
 }
@@ -3033,9 +3030,11 @@ function drawOutlineIcon() {
 
 let _nucleusIconRAF = null;
 let _iconLast = -67;
+let _iconJitterEnergy = 1.0;
 function nucleusIconLoop(now) {
   if (now - _iconLast >= 67) {   // ~15 fps
     _iconLast = now;
+    _iconJitterEnergy *= 0.78;
     // Animate jitter for all nucleus particle arrays
     for (const pts of Object.values(nucleusIconParticlesMap)) {
       for (const p of pts) {
@@ -3065,6 +3064,7 @@ function nucleusIconLoop(now) {
       });
     }
     drawMiniNucleusIcon(document.getElementById('particlesModeIcon'));
+    if (_iconJitterEnergy < 0.01) { _nucleusIconRAF = null; return; }
   }
   _nucleusIconRAF = requestAnimationFrame(nucleusIconLoop);
 }
@@ -3480,6 +3480,13 @@ function idleParticleLoop(now) {
     _idleParticleLast = now;
     updateParticleJitter(animParent.particles.length, 1, true);
     drawStaticFrame();
+    // Stop once jitter has decayed to imperceptible levels — canvas is static
+    let maxMag = 0;
+    for (const j of particleJitter) {
+      const m = Math.abs(j.x) + Math.abs(j.y);
+      if (m > maxMag) maxMag = m;
+    }
+    if (maxMag < 0.15) { idleParticleRAF = null; return; }
   }
   idleParticleRAF = requestAnimationFrame(idleParticleLoop);
 }
@@ -3677,6 +3684,7 @@ window.addEventListener('mouseup', () => {
   dragRotX = 0;
   canvas.style.cursor = '';
   drawForceViz();   // snap arrows back to horizontal
+  if (showParticles && !idleParticleRAF) idleParticleLoop(0);
 });
 
 // ─── Energy model ─────────────────────────────────────────────────────────────
@@ -3980,8 +3988,8 @@ document.addEventListener('visibilitychange', () => {
     if (neutronRAF)       { cancelAnimationFrame(neutronRAF);       neutronRAF       = null; }
     if (playbackRAF)      { cancelAnimationFrame(playbackRAF);      playbackRAF      = null; }
   } else {
-    if (!_neutronIconRAF) { _neutronIconLast = -67; neutronIconLoop(0); }
-    if (!_nucleusIconRAF) { _iconLast = -67; nucleusIconLoop(0); }
+    if (!_neutronIconRAF) { _neutronIconLast = -67; _neutronIconEnergy = 1.0; neutronIconLoop(0); }
+    if (!_nucleusIconRAF) { _iconLast = -67; _iconJitterEnergy = 1.0; nucleusIconLoop(0); }
     if (showParticles && !idleParticleRAF) { _idleParticleLast = 0; idleParticleLoop(0); }
   }
 });
