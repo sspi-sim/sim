@@ -72,9 +72,7 @@
     flex-direction: column;
     gap: 6px;
     padding: 10px 20px 10px;
-    background: var(--ui-bg);
-    backdrop-filter: blur(18px);
-    -webkit-backdrop-filter: blur(18px);
+    background: rgba(8,6,24,0.88);
     box-shadow: 0 4px 20px rgba(0,0,0,0.5);
   }
 
@@ -107,9 +105,7 @@
     align-items: center;
     gap: 10px;
     padding: 0 103px 0 16px;
-    background: var(--ui-bg);
-    backdrop-filter: blur(18px);
-    -webkit-backdrop-filter: blur(18px);
+    background: rgba(8,6,24,0.88);
     border-top: 1px solid var(--ui-border);
     box-shadow: 0 -1px 0 var(--accent1-dim), 0 -4px 20px rgba(0,0,0,0.5);
   }
@@ -703,8 +699,6 @@
     border: 1px solid var(--accent2);
     border-radius: 12px;
     z-index: 15;
-    backdrop-filter: blur(10px);
-    -webkit-backdrop-filter: blur(10px);
     padding: 10px 10px 8px;
     box-shadow: 0 0 24px var(--accent2-dim);
     cursor: grab;
@@ -3887,17 +3881,25 @@ function drawParticleIcon(canvas, type) {
 }
 
 // Icon animation loop — runs independently; picks up theme changes automatically
-function iconAnimLoop() {
-  for (const key of ['proton', 'neutron']) {
-    const j = iconJitter[key];
-    j.x += (Math.random() - 0.5) * 0.7;
-    j.y += (Math.random() - 0.5) * 0.7;
-    j.x *= 0.78;
-    j.y *= 0.78;
+let _iconAnimRAF = null;
+let _iconAnimLast = -67;
+let _iconAnimEnergy = 1.0;
+function iconAnimLoop(now) {
+  _iconAnimEnergy *= 0.78;
+  if (_iconAnimEnergy < 0.01) { _iconAnimRAF = null; return; }
+  if (now - _iconAnimLast >= 67) {
+    _iconAnimLast = now;
+    for (const key of ['proton', 'neutron']) {
+      const j = iconJitter[key];
+      j.x += (Math.random() - 0.5) * 0.7;
+      j.y += (Math.random() - 0.5) * 0.7;
+      j.x *= 0.78;
+      j.y *= 0.78;
+    }
+    if (protonIconCanvas)  drawParticleIcon(protonIconCanvas,  'proton');
+    if (neutronIconCanvas) drawParticleIcon(neutronIconCanvas, 'neutron');
   }
-  if (protonIconCanvas)  drawParticleIcon(protonIconCanvas,  'proton');
-  if (neutronIconCanvas) drawParticleIcon(neutronIconCanvas, 'neutron');
-  requestAnimationFrame(iconAnimLoop);
+  _iconAnimRAF = requestAnimationFrame(iconAnimLoop);
 }
 
 function applyTheme(key) {
@@ -4123,23 +4125,43 @@ let ambientId = null;
 let _ambientDrawSkip = 0;
 function ambientLoop() {
   noiseFrame++;
-  updateJitter(); // always update every RAF so jitter state stays smooth
-  if (!running) {
+  if (running) {
+    updateJitter(); // keep jitter fresh at full rate for loop()'s draw()
+  } else {
     // Throttle idle redraws to ~15 fps (every 4th RAF) — full canvas repaint
     // (incl. heatmaps) is expensive; jitter is imperceptible above ~12 fps.
     _ambientDrawSkip = (_ambientDrawSkip + 1) % 4;
     if (_ambientDrawSkip === 0) {
+      updateJitter();
       if (scrubFrame >= 0) {
         renderFrame(scrubFrame);
       } else {
-        draw();
+        // Skip draw once jitter has decayed to imperceptible levels
+        let _maxMag = 0;
+        for (const j of jitter) {
+          const m = Math.abs(j.x) + Math.abs(j.y);
+          if (m > _maxMag) _maxMag = m;
+        }
+        if (_maxMag >= 0.15) draw();
       }
     }
   }
   ambientId = requestAnimationFrame(ambientLoop);
 }
 ambientLoop();
-iconAnimLoop();
+iconAnimLoop(0);
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    if (_iconAnimRAF) { cancelAnimationFrame(_iconAnimRAF); _iconAnimRAF = null; }
+    if (ambientId)    { cancelAnimationFrame(ambientId);   ambientId    = null; }
+    if (animId)       { cancelAnimationFrame(animId);      animId       = null; }
+  } else {
+    if (!_iconAnimRAF) { _iconAnimLast = -67; _iconAnimEnergy = 1.0; iconAnimLoop(0); }
+    if (!ambientId)    { ambientId = requestAnimationFrame(ambientLoop); }
+    if (running && !animId) { animId = requestAnimationFrame(loop); }
+  }
+});
 
 // ── Hash-driven tab routing (applyHash is the ONLY source of truth) ──
 // Re-establishes a known baseline UI before applying the per-hash branch
