@@ -1813,7 +1813,7 @@ function applyTab(tab) {
   viewZoom = zoomFromSlider(0);
   heatmapDirty = true;
   if (typeof drawStaticFrame === 'function') drawStaticFrame();
-  if (showParticles && !idleParticleRAF && typeof idleParticleLoop === 'function') idleParticleLoop();
+  if (showParticles && !idleParticleRAF && typeof idleParticleLoop === 'function') idleParticleLoop(0);
 }
 let showParticles = true;
 let currentScrubFrac = 0;
@@ -2812,6 +2812,8 @@ function drawSpeedLines() {
 
 // ─── Neutron icon ─────────────────────────────────────────────────────────────
 const neutronIconJitter = { x: 0, y: 0 };
+let _neutronIconRAF = null;
+let _neutronIconLast = -67;
 
 function drawNeutronIconToCanvas(canvas) {
   if (!canvas) return;
@@ -2846,15 +2848,18 @@ function drawNeutronIcon() {
   drawNeutronIconToCanvas(document.getElementById('neutronIconCanvas'));
 }
 
-function neutronIconLoop() {
-  neutronIconJitter.x += (Math.random() - 0.5) * 0.7;
-  neutronIconJitter.y += (Math.random() - 0.5) * 0.7;
-  neutronIconJitter.x *= 0.78;
-  neutronIconJitter.y *= 0.78;
-  drawNeutronIcon();
-  requestAnimationFrame(neutronIconLoop);
+function neutronIconLoop(now) {
+  if (now - _neutronIconLast >= 67) {
+    _neutronIconLast = now;
+    neutronIconJitter.x += (Math.random() - 0.5) * 0.7;
+    neutronIconJitter.y += (Math.random() - 0.5) * 0.7;
+    neutronIconJitter.x *= 0.78;
+    neutronIconJitter.y *= 0.78;
+    drawNeutronIcon();
+  }
+  _neutronIconRAF = requestAnimationFrame(neutronIconLoop);
 }
-neutronIconLoop();
+neutronIconLoop(0);
 
 // ─── Nucleus button icon (New button) ─────────────────────────────────────────
 // Sphere-packed particles for the NEW button icon canvas.
@@ -3026,6 +3031,7 @@ function drawOutlineIcon() {
   c.closePath(); c.stroke(); c.restore();
 }
 
+let _nucleusIconRAF = null;
 let _iconLast = -67;
 function nucleusIconLoop(now) {
   if (now - _iconLast >= 67) {   // ~15 fps
@@ -3060,7 +3066,7 @@ function nucleusIconLoop(now) {
     }
     drawMiniNucleusIcon(document.getElementById('particlesModeIcon'));
   }
-  requestAnimationFrame(nucleusIconLoop);
+  _nucleusIconRAF = requestAnimationFrame(nucleusIconLoop);
 }
 nucleusIconLoop(0);
 drawOutlineIcon();
@@ -3467,9 +3473,11 @@ document.getElementById('energyGraphToggle').addEventListener('click', function(
 });
 
 let idleParticleRAF = null;
-function idleParticleLoop() {
+let _idleParticleLast = 0;
+function idleParticleLoop(now) {
   if (!showParticles) { idleParticleRAF = null; return; }
-  if ((neutronState === 'idle' || neutronState === 'done') && animParent) {
+  if (now - _idleParticleLast >= 67 && (neutronState === 'idle' || neutronState === 'done') && animParent) {
+    _idleParticleLast = now;
     updateParticleJitter(animParent.particles.length, 1, true);
     drawStaticFrame();
   }
@@ -3493,7 +3501,7 @@ document.querySelectorAll('.awheel-item[data-pmode]').forEach(btn => {
     showParticles = btn.dataset.pmode === 'particles';
     logAction('View mode: ' + btn.dataset.pmode);
     setParticleWheelActive(btn);
-    if (showParticles && !idleParticleRAF) idleParticleLoop();
+    if (showParticles && !idleParticleRAF) idleParticleLoop(0);
     drawStaticFrame();
   });
 });
@@ -3962,7 +3970,21 @@ initNuclei();
 }());
 
 drawStaticFrame();
-if (showParticles && !idleParticleRAF) idleParticleLoop();
+if (showParticles && !idleParticleRAF) idleParticleLoop(0);
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    if (_neutronIconRAF)  { cancelAnimationFrame(_neutronIconRAF);  _neutronIconRAF  = null; }
+    if (_nucleusIconRAF)  { cancelAnimationFrame(_nucleusIconRAF);  _nucleusIconRAF  = null; }
+    if (idleParticleRAF)  { cancelAnimationFrame(idleParticleRAF);  idleParticleRAF  = null; }
+    if (neutronRAF)       { cancelAnimationFrame(neutronRAF);       neutronRAF       = null; }
+    if (playbackRAF)      { cancelAnimationFrame(playbackRAF);      playbackRAF      = null; }
+  } else {
+    if (!_neutronIconRAF) { _neutronIconLast = -67; neutronIconLoop(0); }
+    if (!_nucleusIconRAF) { _iconLast = -67; nucleusIconLoop(0); }
+    if (showParticles && !idleParticleRAF) { _idleParticleLast = 0; idleParticleLoop(0); }
+  }
+});
 
 // ── Dev recording menu (right-click replay button) ───────────────────────────
 (function() {
