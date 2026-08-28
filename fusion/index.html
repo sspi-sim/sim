@@ -42,9 +42,7 @@
     flex-direction: column;
     gap: 6px;
     padding: 10px 20px 12px;
-    background: var(--ui-bg);
-    backdrop-filter: blur(18px);
-    -webkit-backdrop-filter: blur(18px);
+    background: rgba(8,6,24,0.88);
     border-bottom: 1px solid var(--ui-border);
     box-shadow: 0 4px 24px rgba(0,0,0,0.55);
     z-index: 10;
@@ -3529,11 +3527,16 @@ drawSpeedLines();
 
 
 let _iconSkip = 0;
-(function animateIcons() {
+let _iconAnimRAF = null;
+let _iconAnimEnergy = 1.0;
+function animateIcons() {
+  _iconAnimEnergy *= 0.78;
+  if (_iconAnimEnergy < 0.01) { _iconAnimRAF = null; return; }
   _iconSkip = (_iconSkip + 1) % 4;
   if (_iconSkip === 0) pselIcons.forEach(c => drawClusterIcon(c));
-  requestAnimationFrame(animateIcons);
-})();
+  _iconAnimRAF = requestAnimationFrame(animateIcons);
+}
+animateIcons();
 
 // ============================================================
 //  ANIMATION LOOP
@@ -3567,28 +3570,38 @@ function updateJitter() {
 // Only redraws on the fusion tab — the temp tab manages its own canvas, and calling
 // fusion's draw() while on the temp tab would clobber the temp UI (including while paused).
 let _idleDrawSkip = 0;
-(function idleJitter() {
-  updateJitter(); // always update every RAF so jitter state stays smooth
-  // Throttle idle redraws to ~15 fps (every 4th RAF).
-  // Jitter position updates still run every RAF above; only the canvas repaint is gated.
+let _idleJitterRAF = null;
+function idleJitter() {
+  // Throttle all work to ~15 fps (every 4th RAF) — jitter is imperceptible faster.
   _idleDrawSkip = (_idleDrawSkip + 1) % 4;
+  if (_idleDrawSkip !== 0) { _idleJitterRAF = requestAnimationFrame(idleJitter); return; }
+
+  updateJitter();
+
   if (currentTab === 'temp' && !tempRunning && !tempPaused) {
     for (const p of tempProtons) {
       if (p._jx === undefined) { p._jx = 0; p._jy = 0; }
       p._jx += (Math.random() - 0.5) * 0.7; p._jx *= 0.78;
       p._jy += (Math.random() - 0.5) * 0.7; p._jy *= 0.78;
     }
-    if (_idleDrawSkip === 0) drawTemp();
+    drawTemp();
   }
-  if (currentTab === 'fusion' && !running && _idleDrawSkip === 0) {
+  if (currentTab === 'fusion' && !running) {
     if (scrubFrame >= 0) {
       renderFrame(scrubFrame); // keep showing the scrubbed frame with fresh jitter
     } else {
-      draw();
+      // Skip draw once all particle jitter has decayed to imperceptible levels
+      let _maxMag = 0;
+      for (const p of particles) {
+        const m = Math.abs(p._jx ?? 0) + Math.abs(p._jy ?? 0);
+        if (m > _maxMag) _maxMag = m;
+      }
+      if (_maxMag >= 0.15) draw();
     }
   }
-  requestAnimationFrame(idleJitter);
-})();
+  _idleJitterRAF = requestAnimationFrame(idleJitter);
+}
+idleJitter();
 
 function frameSpeed() { return FRAME_SPEED * (0.1 + (simSpeed - 1) * (1.4 / 9)); }
 // Scale a base frame count so that collision/escape phases stay proportional
@@ -4701,6 +4714,22 @@ document.getElementById('bugModal').addEventListener('click', e => {
 });
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && document.getElementById('bugModal').style.display === 'flex') closeBugModal();
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    if (_iconAnimRAF)   { cancelAnimationFrame(_iconAnimRAF);   _iconAnimRAF   = null; }
+    if (_idleJitterRAF) { cancelAnimationFrame(_idleJitterRAF); _idleJitterRAF = null; }
+    if (animId)         { cancelAnimationFrame(animId);         animId         = null; }
+    if (replayRAF)      { cancelAnimationFrame(replayRAF);      replayRAF      = null; }
+    if (tempRAF)        { cancelAnimationFrame(tempRAF);        tempRAF        = null; }
+  } else {
+    if (!_iconAnimRAF)   { _iconAnimEnergy = 1.0; animateIcons(); }
+    if (!_idleJitterRAF) { _idleDrawSkip = 0; idleJitter(); }
+    if (running && !animId)      { animId  = requestAnimationFrame(loop); }
+    if (tempRunning && !tempRAF) { tempRAF = requestAnimationFrame(tempLoop); }
+    // replayRAF: replayLoop is scoped to doReplay() — user can press Replay to resume
+  }
 });
 </script>
 

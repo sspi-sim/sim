@@ -55,9 +55,7 @@
     flex-direction: column;
     gap: 6px;
     padding: 10px 20px 10px;
-    background: var(--ui-bg);
-    backdrop-filter: blur(18px);
-    -webkit-backdrop-filter: blur(18px);
+    background: rgba(8,6,24,0.88);
     box-shadow: 0 4px 24px rgba(0,0,0,0.55);
   }
 
@@ -1563,7 +1561,7 @@ function applyTab(tab) {
   _crBtn.textContent = 'Insert Control Rods';
   heatmapDirty = true;
   if (typeof drawStaticFrame === 'function') drawStaticFrame();
-  if (showParticles && !idleParticleRAF && typeof idleParticleLoop === 'function') idleParticleLoop();
+  if (showParticles && !idleParticleRAF && typeof idleParticleLoop === 'function') idleParticleLoop(0);
 }
 let showParticles = true;
 let currentScrubFrac = 0;
@@ -2649,15 +2647,22 @@ function drawNeutronIcon() {
 }
 
 let _neutronIconRAF = null;
-function neutronIconLoop() {
-  neutronIconJitter.x += (Math.random() - 0.5) * 0.7;
-  neutronIconJitter.y += (Math.random() - 0.5) * 0.7;
-  neutronIconJitter.x *= 0.78;
-  neutronIconJitter.y *= 0.78;
-  drawNeutronIcon();
+let _neutronIconLast = -67;
+let _neutronIconEnergy = 1.0;
+function neutronIconLoop(now) {
+  _neutronIconEnergy *= 0.78;
+  if (_neutronIconEnergy < 0.01) { _neutronIconRAF = null; return; }
+  if (now - _neutronIconLast >= 67) {
+    _neutronIconLast = now;
+    neutronIconJitter.x += (Math.random() - 0.5) * 0.7;
+    neutronIconJitter.y += (Math.random() - 0.5) * 0.7;
+    neutronIconJitter.x *= 0.78;
+    neutronIconJitter.y *= 0.78;
+    drawNeutronIcon();
+  }
   _neutronIconRAF = requestAnimationFrame(neutronIconLoop);
 }
-if (!_neutronIconRAF) neutronIconLoop();
+if (!_neutronIconRAF) neutronIconLoop(0);
 
 // ─── Nucleus button icon (New button) ─────────────────────────────────────────
 // Sphere-packed particles for the NEW button icon canvas.
@@ -2831,7 +2836,10 @@ function drawOutlineIcon() {
 
 let _iconLast = -67;
 let _nucleusIconRAF = null;
+let _nucleusIconEnergy = 1.0;
 function nucleusIconLoop(now) {
+  _nucleusIconEnergy *= 0.78;
+  if (_nucleusIconEnergy < 0.01) { _nucleusIconRAF = null; return; }
   if (now - _iconLast >= 67) {   // ~15 fps
     _iconLast = now;
     // Animate jitter for all nucleus particle arrays
@@ -3096,11 +3104,22 @@ document.getElementById('qualitySelect').addEventListener('change', function() {
 });
 
 let idleParticleRAF = null;
-function idleParticleLoop() {
+let _idleParticleLast = 0;
+function idleParticleLoop(now) {
   if (!showParticles) { idleParticleRAF = null; return; }
-  if ((neutronState === 'idle' || neutronState === 'done') && animParent && !chainRAF) {
-    updateParticleJitter(animParent.particles.length, 1, true);
-    drawStaticFrame();
+  if (now - _idleParticleLast >= 67) {
+    _idleParticleLast = now;
+    if ((neutronState === 'idle' || neutronState === 'done') && animParent && !chainRAF) {
+      updateParticleJitter(animParent.particles.length, 1, true);
+      // Stop once jitter has decayed to imperceptible levels
+      let maxMag = 0;
+      for (const j of particleJitter) {
+        const m = Math.abs(j.x) + Math.abs(j.y);
+        if (m > maxMag) maxMag = m;
+      }
+      if (maxMag < 0.15) { idleParticleRAF = null; return; }
+      drawStaticFrame();
+    }
   }
   idleParticleRAF = requestAnimationFrame(idleParticleLoop);
 }
@@ -3114,7 +3133,7 @@ document.querySelectorAll('.awheel-item[data-pmode]').forEach(btn => {
   btn.addEventListener('click', () => {
     showParticles = btn.dataset.pmode === 'particles';
     setParticleWheelActive(btn);
-    if (showParticles && !idleParticleRAF) idleParticleLoop();
+    if (showParticles && !idleParticleRAF) idleParticleLoop(0);
     drawStaticFrame();
   });
 });
@@ -3372,7 +3391,7 @@ initNuclei();
 }());
 
 drawStaticFrame();
-if (showParticles && !idleParticleRAF) idleParticleLoop();
+if (showParticles && !idleParticleRAF) idleParticleLoop(0);
 
 
 // ── Bug report button ─────────────────────────────────────────────────────
@@ -3404,6 +3423,20 @@ document.getElementById('bugModal').addEventListener('click', e => {
 });
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && document.getElementById('bugModal').style.display === 'flex') closeBugModal();
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    if (_neutronIconRAF)  { cancelAnimationFrame(_neutronIconRAF);  _neutronIconRAF  = null; }
+    if (_nucleusIconRAF)  { cancelAnimationFrame(_nucleusIconRAF);  _nucleusIconRAF  = null; }
+    if (idleParticleRAF)  { cancelAnimationFrame(idleParticleRAF);  idleParticleRAF  = null; }
+    if (neutronRAF)       { cancelAnimationFrame(neutronRAF);       neutronRAF       = null; }
+    if (chainRAF)         { cancelAnimationFrame(chainRAF);         chainRAF         = null; }
+  } else {
+    if (!_neutronIconRAF) { _neutronIconLast = -67; _neutronIconEnergy = 1.0; neutronIconLoop(0); }
+    if (!_nucleusIconRAF) { _iconLast = -67; _nucleusIconEnergy = 1.0; nucleusIconLoop(0); }
+    if (showParticles && !idleParticleRAF) { _idleParticleLast = 0; idleParticleLoop(0); }
+  }
 });
 </script>
 
