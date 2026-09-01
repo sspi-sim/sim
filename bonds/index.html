@@ -830,7 +830,7 @@
       <button class="tab-btn" data-mode="molecules">Molecules</button>
     </div>
     <div style="display:flex;align-items:center;gap:6px;margin-left:auto;">
-      <span style="font-size:10px;font-weight:600;letter-spacing:0.06em;color:rgba(255,255,255,0.45);white-space:nowrap;">Field Test Version 1.2</span>
+      <span style="font-size:10px;font-weight:600;letter-spacing:0.06em;color:rgba(255,255,255,0.45);white-space:nowrap;">Field Test Version 1.3</span>
       <select id="qualitySelect">
         <option value="hi-res">Hi-res</option>
         <option value="simple">Simple</option>
@@ -1729,9 +1729,10 @@ _bondPairConfigs['11,8'] = {
   bondConfineSectorOffsetB: 30, bondConfineSectorRangeB: 280,
 };
 // O-H shells defaults — pre-seeded so first load applies immediately
-// Pb-Cl: ΔEN=0.83; Pb has 3 non-bonding valence e, 1 shared. Both bond electrons orbit Cl only (gIsB=true so sphere-G = Cl).
+// Pb-Cl: ΔEN=1.29; Pb shares 1 e, Cl shares 1 e. 4 orbits around Cl (G) per 1 orbit around Pb (L).
 _bondPairConfigs['82,17'] = {
   bondSepMult: 246,
+  bondSpeed: 0.13,
   bondDotCenterFrac: 0.60,
   bondDotColor0: '#aa55ff',  // Pb — violet
   bondDotColor1: '#44ff44',  // Cl — green
@@ -1739,7 +1740,6 @@ _bondPairConfigs['82,17'] = {
   bondShellsSubtractB: true,
   bondConfineSectorOffset: 35,  bondConfineSectorRange: 320,
   bondConfineSectorOffsetB: 0, bondConfineSectorRangeB: 250,
-  bondCycleOverride: ['sphere-G'],  // both electrons orbit Cl only (G=Cl since Cl more EN)
 };
 _bondPairConfigs['8,1'] = {
   bondSepMult: 95,
@@ -1811,6 +1811,7 @@ _bondPairConfigs['10,10'] = {
 // Sn-Cl: ΔEN=1.20 → n=4; Sn has 3 non-bonding valence e, Cl has 6
 _bondPairConfigs['50,17'] = {
   bondSepMult: 239,
+  bondSpeed: 0.13,
   bondRadial: 0.15,
   bondDotCenterFrac: 0.60,
   bondDotColor0: '#ff44cc',  // Sn — magenta
@@ -1821,16 +1822,15 @@ _bondPairConfigs['50,17'] = {
   bondConfineSectorOffsetB: 35, bondConfineSectorRangeB: 320,
   orbShellSpeed: [3.0, 2.5, 2.0, 1.5, 2.8, 3.0],
 };
-// K-Cl: fully ionic. K gives its 4s electron to Cl; that electron orbits Cl only.
+// K-Cl: fully ionic. K gives its 4s electron to Cl; both bond electrons orbit Cl only.
 _bondPairConfigs['19,17'] = {
   bondSepMult: 295,
   bondDotColor0: '#ff66cc',       // K electron — pink dot orbiting Cl
-  bondDotColor1: '#44ff44',       // Cl bonding electron — green dot at bond boundary
+  bondDotColor1: '#44ff44',       // Cl bonding electron — green dot orbiting Cl
   bondShellsSubtractA: true,
   bondShellsSubtractB: true,
-  bondCycleOverride: ['sphere-G'],
+  bondCycleOverride: ['sphere-G', 'sphere-G'],  // both electrons orbit Cl; 2-element cycle so wander re-randomizes each orbit
   bondIonicAnchorA: 138,          // K+ n=3 shell anchored to 138 pm
-  bondTrailLen: 0,
   bondDotCenterFrac: 0.68,
   bondConfineSectorOffset:  0, bondConfineSectorRange:  290,
   bondConfineSectorOffsetB: 10, bondConfineSectorRangeB: 270,
@@ -2579,10 +2579,13 @@ function _orbitPos(visitType, phase, gIsB, rG, rL, d, effR = _bondEffRadial, eff
     const denom = 1 + Math.cos(t) ** 2;
     return { lx: a * Math.sin(t) / denom, ly: (1 + effW) * a * Math.sin(t) * Math.cos(t) / denom };
   }
-  // Teardrop: lx sign controls which atom the loop tips toward; ly is always positive
-  // so the loop enters "upward," matching fig8-L's exit dly for both gIsB directions.
+  // Ellipse centered on the target nucleus. Horizontal semi-axis = d so the path always
+  // passes through the bond midpoint (0,0) at phase=0/2π for smooth visit transitions.
+  // Vertical semi-axis = rG or rL so the orbit height at the nucleus matches the atom's
+  // 3D orbital shell radius — works correctly for both rG>d (O-H) and rG<d (Pb-Cl).
   const sign = isG ? (gIsB ? 1 : -1) : (gIsB ? -1 : 1);
-  return { lx: sign * a * (1 - Math.cos(phase)) / 2, ly: (1 + effW) * a * Math.sin(phase) / 2 };
+  const _r   = (isG ? rG : rL) * (1 + effR);
+  return { lx: sign * d * (1 - Math.cos(phase)), ly: (1 + effW) * _r * Math.sin(phase) };
 }
 
 // ─── Bond electron (shared, hot-pink) ────────────────────────────────────────
