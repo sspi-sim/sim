@@ -827,10 +827,10 @@
   <div class="toolbar-row">
     <div id="tabBar">
       <button class="tab-btn active" data-mode="bonds">Bonds</button>
-      <button class="tab-btn" data-mode="molecules">Molecules</button>
+      <button class="tab-btn" data-mode="molecules">Molecules / Crystals</button>
     </div>
     <div style="display:flex;align-items:center;gap:6px;margin-left:auto;">
-      <span style="font-size:10px;font-weight:600;letter-spacing:0.06em;color:rgba(255,255,255,0.45);white-space:nowrap;">Field Test Version 1.3</span>
+      <span style="font-size:10px;font-weight:600;letter-spacing:0.06em;color:rgba(255,255,255,0.45);white-space:nowrap;">Field Test Version 1.4</span>
       <select id="qualitySelect">
         <option value="hi-res">Hi-res</option>
         <option value="simple">Simple</option>
@@ -861,19 +861,19 @@
       <div id="bondCtrlBox" style="display:flex;flex-direction:column;gap:6px;overflow:hidden;max-height:999px;">
       <span id="bondComboLabel" style="font-size:11px;letter-spacing:0.08em;text-transform:uppercase;opacity:0.6;font-weight:700;line-height:1.25;text-align:center">Pair of<br>Atoms</span>
       <select id="bondComboSelect" style="width:100%;font-size:13px;font-family:inherit;border:1px solid rgba(255,45,120,0.35);border-radius:6px;padding:5px 8px;cursor:pointer;">
-        <option value="82,17">Pb–Cl</option>
-        <option value="50,17">Sn–Cl</option>
-        <option value="19,17">K–Cl</option>
         <option value="11,17">Na–Cl</option>
-        <option value="6,6">C–C</option>
-        <option value="6,1">C–H</option>
-        <option value="8,1">O–H</option>
+        <option value="19,17">K–Cl</option>
+        <option value="50,17">Sn–Cl</option>
+        <option value="82,17">Pb–Cl</option>
+        <option value="8,1">H–O</option>
         <option value="6,8">C–O</option>
-        <option value="1,1">H–H</option>
-        <option value="10,10">Ne–Ne</option>
-        <option value="2,2">He–He</option>
-        <option value="82,8">Pb–O</option>
         <option value="11,8" selected>Na–O</option>
+        <option value="82,8">Pb–O</option>
+        <option value="6,1">C–H</option>
+        <option value="6,6">C–C</option>
+        <option value="1,1">H–H</option>
+        <option value="2,2">He–He</option>
+        <option value="10,10">Ne–Ne</option>
       </select>
       </div><!-- /bondCtrlBox -->
       <!-- bondArcDisplay / bondRadDisplay kept for JS compat -->
@@ -1711,6 +1711,7 @@ function _loadBondConfig(key) {
 }
 // Pb-O: 3 non-bonding on Pb, 5 on O, 1 bonding e from each — sector spacing from Pb-Cl (Pb) and O-H (O)
 _bondPairConfigs['82,8'] = {
+  bondSpeed: 0.12,
   bondDotCenterFrac: 0.7,
   bondDotColor0: '#aa55ff',  // Pb — violet
   bondDotColor1: '#ff2222',  // O — red
@@ -1726,6 +1727,8 @@ _bondPairConfigs['11,8'] = {
   bondDotColor1: '#ff2222',  // O — red
   bondShellsSubtractA: true,
   bondShellsSubtractB: true,
+  bondIonicAnchorA: 100,     // Na+ n=2 shell = 100 pm (Shannon ionic radius)
+  bondTrailLen: 0,           // suppress 2D trail; both electrons injected into O's 3D orbitals below
   bondConfineSectorOffsetB: 30, bondConfineSectorRangeB: 280,
 };
 // O-H shells defaults — pre-seeded so first load applies immediately
@@ -1772,6 +1775,7 @@ _bondPairConfigs['6,6'] = {
 // C-O: 3 non-bonding on C, 5 on O, 1 bonding e from each
 _bondPairConfigs['6,8'] = {
   bondSepMult: 138,
+  bondSpeed: 0.13,
   bondDotCenterFrac: 0.53,
   bondShellsSubtractA: true,
   bondShellsSubtractB: true,
@@ -1814,7 +1818,7 @@ _bondPairConfigs['50,17'] = {
   bondSpeed: 0.13,
   bondRadial: 0.15,
   bondDotCenterFrac: 0.60,
-  bondDotColor0: '#ff44cc',  // Sn — magenta
+  bondDotColor0: '#00ffcc',  // Sn — neon teal
   bondDotColor1: '#44ff44',  // Cl — green
   bondShellsSubtractA: true,
   bondShellsSubtractB: true,
@@ -1831,6 +1835,7 @@ _bondPairConfigs['19,17'] = {
   bondShellsSubtractB: true,
   bondCycleOverride: ['sphere-G', 'sphere-G'],  // both electrons orbit Cl; 2-element cycle so wander re-randomizes each orbit
   bondIonicAnchorA: 138,          // K+ n=3 shell anchored to 138 pm
+  bondTrailLen: 0,                // suppress flat trail; orbitals injected as 3D orbits below
   bondDotCenterFrac: 0.68,
   bondConfineSectorOffset:  0, bondConfineSectorRange:  290,
   bondConfineSectorOffsetB: 10, bondConfineSectorRangeB: 270,
@@ -1843,8 +1848,9 @@ let _bondSoftSteerN   = 0;    // frames remaining of reduced steer after sphere�
 let _bondSoftSteerN2  = 0;
 let bondSepMult  = null; // bond separation in pm (sim pm: multiply by shellBaseR to get world pixels)
 let molPreset = 'co2';
-let molSites  = []; // { Z, ap, elecs, cx_rel, cy_rel }
+let molSites  = []; // { Z, ap, elecs, shellGroups, trailShellGroups, cx_rel, cy_rel }
 let molBonds  = []; // [[i, j], ...]
+let molBondElecs = []; // bond electron trail state for molecule trails view
 
 // ─── Electron physics ─────────────────────────────────────────────────────────
 // Each electron: { x, y, vx, vy, trail: [{x,y}] }
@@ -1867,10 +1873,10 @@ const ELEMENT_VALENCE_COLORS = {
   19: '#ff66cc',   // K  — pink
   29: '#00ddff',   // Cu — cyan
   36: '#888888',   // Kr — gray (noble)
-  50: '#ff44cc',   // Sn — magenta
+  50: '#00ffcc',   // Sn — neon teal
   82: '#aa55ff',   // Pb — violet
 };
-const _INNER_E_COLOR = '#666677';
+const _INNER_E_COLOR = '#777777';
 
 function _valenceColorForZ(Z) {
   if (Z === 1 && document.body.classList.contains('screenshot-mode')) return '#aaaaaa';
@@ -2055,7 +2061,7 @@ function stepOrbit3D(dt = 1) {
   }
 }
 
-function _drawOrbit3DCore(ctx, cx, cy, elecs, shellGroups, Z) {
+function _drawOrbit3DCore(ctx, cx, cy, elecs, shellGroups, Z, forceAllGray = false, shellRFn = null) {
   if (!elecs.length) return;
   const LIGHT = document.body.classList.contains('screenshot-mode');
   const W = canvas.width;
@@ -2067,13 +2073,14 @@ function _drawOrbit3DCore(ctx, cx, cy, elecs, shellGroups, Z) {
     return [cx+rx, cy-(ry*cosEL-rz*sinEL)];
   }
   const occupied = [...new Set(elecs.map(e => e.shell))].sort((a,b)=>a-b);
-  const _outerS3D = occupied.length ? occupied[occupied.length - 1] : 0;
+  // forceAllGray: cation (e.g. Na+) has no valence electrons — all shells rendered as inner (gray)
+  const _outerS3D = forceAllGray ? Infinity : (occupied.length ? occupied[occupied.length - 1] : 0);
   const _nB = _quality === 'hi-res' ? 32 : _quality === 'detailed' ? 4 : 2;
   const _trailMaxAlpha = LIGHT ? 0.92 : 0.75;
   ctx.lineWidth = 1.5;
   ctx.lineCap = 'round';
   for (const s of occupied) {
-    const r3d = getShellRadiusForZ(s, Z) * orb3dRadScale * viewZoom;
+    const r3d = (shellRFn ? shellRFn(s) : getShellRadiusForZ(s, Z)) * orb3dRadScale * viewZoom;
     const _shellOffScreen = r3d > W * 0.6;
     if (_shellOffScreen && _quality !== 'hi-res') continue;
     const defaultCol = LIGHT ? _darkenHex(_shellColorForZ(s, Z, _outerS3D)) : _shellColorForZ(s, Z, _outerS3D);
@@ -2523,6 +2530,7 @@ function setAtomBFromZ(Z) {
   electronsB=[];
   bondElecFracs=[];
   syncNeutralElectronsB();
+  for (let s = 0; s < ORB3D_N; s++) _clearOrb3dShellB(s);
   syncOrb3dShellSlidersB();
   syncElemBtnActiveB();
 }
@@ -2599,7 +2607,7 @@ function stepBondElectron() {
   if (bondOrbitVisit !== _prevBondVisit) {
     _prevBondVisit    = bondOrbitVisit;
     _bondTargetRadial = (Math.random() * 2 - 1) * bondRadial;
-    _bondTargetWander = -Math.random() * Math.abs(bondOrbitWander);
+    _bondTargetWander = bondOrbitWander >= 0 ? (Math.random() * 2 - 1) * bondOrbitWander : -Math.random() * Math.abs(bondOrbitWander);
   }
   // Lerp effective values toward targets — settles within one visit, smooth across boundary
   _bondEffRadial += (_bondTargetRadial - _bondEffRadial) * 0.08;
@@ -2684,7 +2692,7 @@ function _stepBondElecSecond() {
   if (bondOrbitVisit2 !== _prevBondVisit2) {
     _prevBondVisit2    = bondOrbitVisit2;
     _bondTargetRadial2 = (Math.random() * 2 - 1) * bondRadial;
-    _bondTargetWander2 = -Math.random() * Math.abs(bondOrbitWander);
+    _bondTargetWander2 = bondOrbitWander >= 0 ? (Math.random() * 2 - 1) * bondOrbitWander : -Math.random() * Math.abs(bondOrbitWander);
   }
   _bondEffRadial2 += (_bondTargetRadial2 - _bondEffRadial2) * 0.08;
   _bondEffWander2 += (_bondTargetWander2 - _bondEffWander2) * 0.08;
@@ -3480,7 +3488,8 @@ function stepElectrons() {
       }
     }
     e.trail.push({ x: e.x, y: e.y });
-    if (e.trail.length > eTrailLen) e.trail.shift();
+    const _tMax = (_quality === 'simple' && e.shell < _maxShell) ? Math.round(eTrailLen * 0.6) : eTrailLen;
+    if (e.trail.length > _tMax) e.trail.shift();
   }
 }
 
@@ -3684,6 +3693,7 @@ let eRadialJitter = 1.0;             // stochastic radial kick magnitude
 function stepElectronsShellsFor(elecs, Z, confineSector = false, isAtomB = false) {
   // Same-shell repulsion: angular (1/dA, longer range) + radial (one in, one out)
   const outerS = confineSector && elecs.length ? Math.max(...elecs.map(e => e.shell)) : -1;
+  const _maxShell = elecs.length ? Math.max(...elecs.map(e => e.shell)) : 0;
   for (let i = 0; i < elecs.length; i++) {
     for (let j = i + 1; j < elecs.length; j++) {
       const ei = elecs[i], ej = elecs[j];
@@ -3773,7 +3783,7 @@ function stepElectronsShells() {
   stepElectronsShellsFor(electrons, customZ, _confine);
 }
 
-function drawElectronsShellsFor(ctx, elecs, cx, cy, Z, hideOuterShell = false, bondSubtracted = false, ghostShells = [], forceInnerColor = false) {
+function drawElectronsShellsFor(ctx, elecs, cx, cy, Z, hideOuterShell = false, bondSubtracted = false, ghostShells = [], forceInnerColor = false, shellRFn = null) {
   if (!elecs.length && !ghostShells.length) return;
   if (!_eGlowImg) _buildElectronGlow();
   const LIGHT = document.body.classList.contains('screenshot-mode');
@@ -3798,7 +3808,7 @@ function drawElectronsShellsFor(ctx, elecs, cx, cy, Z, hideOuterShell = false, b
   const occupied = new Set(elecs.map(e => e.shell));
   for (const s of ghostShells) occupied.add(s);
   for (const s of occupied) {
-    const r = getShellRadiusForZ(s, Z);
+    const r = shellRFn ? shellRFn(s) : getShellRadiusForZ(s, Z);
     const hwBase = eShellBandHW + r * 0.1;
     const hw = (!forceInnerColor && s === trueOuterS) ? hwBase * 3 : hwBase;
     const rInner = Math.max(0, r - hw);
@@ -3828,7 +3838,7 @@ function drawElectronsShellsFor(ctx, elecs, cx, cy, Z, hideOuterShell = false, b
     for (const e of dotElecs) {
       const hex = e.color ?? _hexFor(e.shell);
       const isValence = !forceInnerColor && e.shell >= trueOuterS;
-      const r = getShellRadiusForZ(e.shell, Z) + (e.radialOffset || 0);
+      const r = (shellRFn ? shellRFn(e.shell) : getShellRadiusForZ(e.shell, Z)) + (e.radialOffset || 0);
       const ex = cx + Math.cos(e.angle) * r;
       const ey = cy + Math.sin(e.angle) * r;
       ctx.globalAlpha = isValence ? 1.0 : 0.45;
@@ -3843,7 +3853,7 @@ function drawElectronsShellsFor(ctx, elecs, cx, cy, Z, hideOuterShell = false, b
   for (const e of dotElecs) {
     const hex = e.color ?? _hexFor(e.shell);
     const isValence = e.shell >= trueOuterS;
-    const r = getShellRadiusForZ(e.shell, Z) + (e.radialOffset || 0);
+    const r = (shellRFn ? shellRFn(e.shell) : getShellRadiusForZ(e.shell, Z)) + (e.radialOffset || 0);
     ctx.fillStyle = hex;
     ctx.globalAlpha = isValence ? 0.9 : 0.4;
     ctx.beginPath();
@@ -3861,7 +3871,7 @@ function drawElectronsShells(ctx) {
 
 }
 
-function drawShellRingsFor(ctx, cx, cy, elecs, Z, forceGray = false) {
+function drawShellRingsFor(ctx, cx, cy, elecs, Z, forceGray = false, shellRFn = null) {
   if (!elecs.length) return;
   const occupied = [...new Set(elecs.map(e => e.shell))];
   const outerS = _outerShellOf(elecs);
@@ -3872,7 +3882,7 @@ function drawShellRingsFor(ctx, cx, cy, elecs, Z, forceGray = false) {
   for (const s of occupied) {
     ctx.strokeStyle = forceGray ? _INNER_E_COLOR : _shellColorForZ(s, Z, outerS);
     ctx.beginPath();
-    ctx.arc(cx, cy, getShellRadiusForZ(s, Z), 0, Math.PI * 2);
+    ctx.arc(cx, cy, shellRFn ? shellRFn(s) : getShellRadiusForZ(s, Z), 0, Math.PI * 2);
     ctx.stroke();
   }
   ctx.restore();
@@ -4556,12 +4566,13 @@ function _distributeInFreeArc(n, takenCens, takenHalf) {
 // bondInfos: array of {dir, color?, isBond?, dist?} for outer-shell electrons that
 // have a pre-assigned sector (bond electrons or transferred electrons).
 // lostOuter: if true, the outer shell is empty (Na in NaCl gave its electron away).
-function _makeMolElecs(Z, ap, bondInfos = [], lostOuter = false, ionicAnchorPm = null, confineLonePairs = null) {
+function _makeMolElecs(Z, ap, bondInfos = [], lostOuter = false, ionicAnchorPm = null, confineLonePairs = null, extraOuter = 0) {
   const shellCounts = { 1:[1], 6:[2,4], 8:[2,6], 11:[2,8,1], 17:[2,8,7] };
   const counts = (shellCounts[Z] || []).slice();
   const outerS = counts.length - 1;
-  const nOuter = counts[outerS] || 0;
   if (lostOuter) counts[outerS] = 0;
+  counts[outerS] = (counts[outerS] || 0) + extraOuter;
+  const nOuter = counts[outerS];
 
   // Precompute per-shell radius: if ionic anchor provided for a cation (lostOuter),
   // anchor the last-occupied shell to ionicAnchorPm and scale inner shells from that.
@@ -4673,7 +4684,7 @@ function initMolecule() {
     ];
     bonds = [[0,1],[0,2]];
   } else { // nacl 3×3
-    const sep = 236 * shellBaseR;
+    const sep = 236 * shellBaseR * 0.8;
     layout = [];
     bonds = [];
     for (let gy = -1; gy <= 1; gy++)
@@ -4687,6 +4698,20 @@ function initMolecule() {
       }
   }
 
+  // Highlight atoms in the mini periodic table
+  const _molZs = [...new Set(layout.map(s => s.Z))];
+  document.querySelectorAll('[data-ptcell]').forEach(el => {
+    el.style.color = 'rgba(200,190,255,0.22)';
+    el.style.background = 'transparent';
+  });
+  _molZs.forEach(Z => {
+    const el = document.querySelector(`[data-ptcell="${Z}"]`);
+    if (!el) return;
+    const c = Z === 1 ? '#aaaaaa' : _valenceColorForZ(Z);
+    el.style.color = c;
+    el.style.background = c + '28';
+  });
+
   // Compute per-site bond electron infos from the bond list
   const bondInfosPerSite = layout.map(() => []);
   const naLostElectron = new Set();
@@ -4695,7 +4720,7 @@ function initMolecule() {
   if (molPreset === 'nacl') {
     for (let i = 0; i < layout.length; i++) {
       if (layout[i].Z === 11) naLostElectron.add(i);
-      // Cl: leave bondInfosPerSite empty so all 7 outer electrons distribute evenly
+      // Cl⁻: the extra electron (from Na) is added via extraOuter below; all 8 distribute evenly
     }
   }
 
@@ -4727,21 +4752,91 @@ function initMolecule() {
 
   const W = canvas.width, H = canvas.height;
   molBonds = bonds;
+
+  // Bond electrons removed from each site's trailShellGroups:
+  // CO2 double bond → 2 per bond per atom; H2O single bond → 1 per bond per atom.
+  const _bondElecPerSite = new Array(layout.length).fill(0);
+  if (molPreset === 'co2') for (const [a, b] of bonds) { _bondElecPerSite[a] += 2; _bondElecPerSite[b] += 2; }
+  if (molPreset === 'h2o') for (const [a, b] of bonds) { _bondElecPerSite[a] += 1; _bondElecPerSite[b] += 1; }
+
   molSites = layout.map((s, i) => {
     const ap = generateNucleus(s.Z, autoNeutrons(s.Z), W/2 + s.cx_rel, H/2 + s.cy_rel, 100 + i * 7);
+    for (const p of ap.particles) { p.x -= ap.cx; p.y -= ap.cy; }
     const lostOuter = naLostElectron.has(i);
     const molLone = (molPreset === 'h2o' && s.Z === 8)
       ? { cen: Math.PI * 1.5, arc: 195 * Math.PI / 180 }
       : null;
-    const elecs = _makeMolElecs(s.Z, ap, bondInfosPerSite[i], lostOuter, lostOuter && s.Z === 11 ? 100 : null, molLone);
-    // NaCl Cl^-: color the first outer-shell electron blue (the transferred Na electron)
+    // NaCl Cl⁻ gains 1 extra outer electron (the Na-transferred electron)
+    const extraOuter = (molPreset === 'nacl' && s.Z === 17) ? 1 : 0;
+    const elecs = _makeMolElecs(s.Z, ap, bondInfosPerSite[i], lostOuter, lostOuter && s.Z === 11 ? 100 : null, molLone, extraOuter);
+
+    // NaCl Cl⁻: the last outer electron is Na's transferred electron — show it blue
     if (molPreset === 'nacl' && s.Z === 17) {
       const outerS = Math.max(...elecs.map(e => e.shell));
-      const first = elecs.find(e => e.shell === outerS);
-      if (first) first.color = _valenceColorForZ(11);
+      const outerElecs = elecs.filter(e => e.shell === outerS);
+      if (outerElecs.length) outerElecs[outerElecs.length - 1].color = _valenceColorForZ(11);
     }
-    return { Z: s.Z, ap, elecs, shellGroups: _buildMolShellGroups(elecs), cx_rel: s.cx_rel, cy_rel: s.cy_rel, lostOuter };
+
+    // Build trailShellGroups with bond electrons removed so they show only as bond trails.
+    let trailShellGroups = null;
+    const nRemove = _bondElecPerSite[i];
+    if (nRemove > 0) {
+      let removed = 0;
+      const trailElecs = elecs.filter(e => {
+        if (removed < nRemove && e.isBond) { removed++; return false; }
+        return true;
+      });
+      trailShellGroups = _buildMolShellGroups(trailElecs);
+    }
+    // NaCl: Na L-shell ×2, Cl K+L shells ×1.5 (Cl outer/M-shell unchanged)
+    const shellR = molPreset === 'nacl' ? (sh => {
+      const base = getShellRadiusForZ(sh, s.Z);
+      if (s.Z === 11 && sh === 1) return base * 2;
+      if (s.Z === 17 && sh < 2)   return base * 1.5;
+      return base;
+    }) : null;
+    return { Z: s.Z, ap, elecs, shellGroups: _buildMolShellGroups(elecs), trailShellGroups, cx_rel: s.cx_rel, cy_rel: s.cy_rel, lostOuter, shellR };
   });
+
+  const _mkBondE = (phase, color) => ({
+    phase, visit: 0, prevVisit: -1, x: 0, y: 0, vx: 0, vy: 0,
+    effR: 0, effW: 0, targetR: 0, targetW: 0, softSteerN: 0, fracs: [], color
+  });
+
+  // CO2 bond electron trail state: 4 electrons per C=O double bond (2 from each atom)
+  molBondElecs = [];
+  if (molPreset === 'co2') {
+    const d = 60 * shellBaseR; // half of 120 pm C=O bond length
+    const rG = getShellRadiusForZ(1, 8); // O outer shell radius
+    const rL = getShellRadiusForZ(1, 6); // C outer shell radius
+    const cycle = ['sphere-G', 'sphere-G', 'sphere-G', 'sphere-L']; // 3 around O for every 1 around C
+    const spd0 = _bondPairConfigs['6,8']?.bondSpeed ?? 0.13;
+    const colC = _valenceColorForZ(6), colO = _valenceColorForZ(8);
+    const trailLen = 300;
+    // Bond [0,1]: O_left(A) ↔ C(B). G=A=O → gIsB=false.
+    molBondElecs.push({ siteAIdx:0, siteBIdx:1, gIsB:false, cycle, rG, rL, d, trailLen, spd0,
+      elecs: [_mkBondE(0, colO), _mkBondE(Math.PI/2, colC), _mkBondE(Math.PI, colO), _mkBondE(3*Math.PI/2, colC)] });
+    // Bond [1,2]: C(A) ↔ O_right(B). G=B=O → gIsB=true.
+    molBondElecs.push({ siteAIdx:1, siteBIdx:2, gIsB:true, cycle, rG, rL, d, trailLen, spd0,
+      elecs: [_mkBondE(0, colC), _mkBondE(Math.PI/2, colO), _mkBondE(Math.PI, colC), _mkBondE(3*Math.PI/2, colO)] });
+  }
+
+  // H2O bond electron trail state: 2 electrons per O-H single bond (1 from each atom)
+  if (molPreset === 'h2o') {
+    const d = 48 * shellBaseR; // half of 96 pm O-H bond length
+    const rG = getShellRadiusForZ(1, 8); // O outer shell (more EN → G)
+    const rL = getShellRadiusForZ(0, 1); // H K-shell (less EN → L)
+    const cycle = ['sphere-G', 'sphere-G', 'sphere-G', 'sphere-G', 'sphere-L']; // 4 around O for every 1 around H
+    const spd0 = _bondPairConfigs['8,1']?.bondSpeed ?? 0.2;
+    const colO = _valenceColorForZ(8), colH = _valenceColorForZ(1);
+    const trailLen = 300;
+    // Bond [0,1]: O(A) ↔ H_left(B). G=A=O → gIsB=false.
+    molBondElecs.push({ siteAIdx:0, siteBIdx:1, gIsB:false, cycle, rG, rL, d, trailLen, spd0,
+      elecs: [_mkBondE(0, colO), _mkBondE(Math.PI, colH)] });
+    // Bond [0,2]: O(A) ↔ H_right(B). G=A=O → gIsB=false.
+    molBondElecs.push({ siteAIdx:0, siteBIdx:2, gIsB:false, cycle, rG, rL, d, trailLen, spd0,
+      elecs: [_mkBondE(0, colO), _mkBondE(Math.PI, colH)] });
+  }
 }
 
 function _molComputeZoom() {
@@ -4804,7 +4899,7 @@ function stepMoleculeElectrons() {
         py = site.ap.cy + e.bondDirY * e.bondTotalDist * e.bondPhase;
         }
       } else {
-        const sr = getShellRadiusForZ(e.shell, site.Z) + (e.radialOffset || 0);
+        const sr = (site.shellR ? site.shellR(e.shell) : getShellRadiusForZ(e.shell, site.Z)) + (e.radialOffset || 0);
         px = site.ap.cx + Math.cos(e.angle) * sr;
         py = site.ap.cy + Math.sin(e.angle) * sr;
       }
@@ -4842,7 +4937,6 @@ function drawMolecule(ctx) {
       ctx.save();
       ctx.translate(sx, sy);
       ctx.scale(molZoom, molZoom);
-      ctx.translate(-site.ap.cx, -site.ap.cy);
       drawParticles(site.ap.particles, 0, 1, ctx);
       ctx.restore();
     }
@@ -4862,8 +4956,8 @@ function drawMolecule(ctx) {
     if (currentTab === 'trails') {
       drawElectronsFor(ctx, site.elecs, site.Z);
     } else {
-      drawShellRingsFor(ctx, site.ap.cx, site.ap.cy, site.elecs, site.Z, site.lostOuter);
-      drawElectronsShellsFor(ctx, site.elecs, site.ap.cx, site.ap.cy, site.Z, false, true, [], site.lostOuter);
+      drawShellRingsFor(ctx, site.ap.cx, site.ap.cy, site.elecs, site.Z, site.lostOuter, site.shellR);
+      drawElectronsShellsFor(ctx, site.elecs, site.ap.cx, site.ap.cy, site.Z, false, true, [], site.lostOuter, site.shellR);
     }
   }
 
@@ -4875,18 +4969,22 @@ function drawMolecule(ctx) {
 // Build orb3d shell groups for a set of electrons (same structure as orb3dShellGroups).
 function _buildMolShellGroups(elecs) {
   const groups = Array.from({length: ORB3D_N}, () => []);
-  const countPerShell = {};
-  for (const e of elecs) countPerShell[e.shell] = (countPerShell[e.shell] || 0) + 1;
+  // Collect electrons per shell in order so individual e.color values are preserved
+  const elecsPerShell = Array.from({length: ORB3D_N}, () => []);
+  for (const e of elecs) { if (e.shell < ORB3D_N) elecsPerShell[e.shell].push(e); }
   for (let s = 0; s < ORB3D_N; s++) {
-    const n = countPerShell[s] || 0;
-    for (let k = 0; k < n; k++) {
+    // Process uncolored electrons first so they pair normally; colored ones become solo groups at the end
+    elecsPerShell[s].sort((a, b) => (a.color ? 1 : 0) - (b.color ? 1 : 0));
+    for (const e of elecsPerShell[s]) {
       const g = groups[s], last = g[g.length - 1];
-      if (last && last.count === 1 && g.length - 1 >= 2) {
+      if (last && last.count === 1 && g.length - 1 >= 2 && !e.color && !last.colorOverride) {
         last.count = 2; last.phOff.push(Math.random() * Math.PI * 2); last.trails.push([]);
       } else {
         const ax = _o3RandAxis(), ref = Math.abs(ax[0]) < 0.9 ? [1,0,0] : [0,1,0];
-        g.push({ count:1, phase:Math.random()*Math.PI*2, phOff:[0],
-          radPh:Math.random()*Math.PI*2, ax, e1:_o3Norm(_o3Cross(ax,ref)), rot:_o3RandAxis(), trails:[[]] });
+        const grp = { count:1, phase:Math.random()*Math.PI*2, phOff:[0],
+          radPh:Math.random()*Math.PI*2, ax, e1:_o3Norm(_o3Cross(ax,ref)), rot:_o3RandAxis(), trails:[[]] };
+        if (e.color) grp.colorOverride = e.color;
+        g.push(grp);
       }
     }
   }
@@ -4896,13 +4994,14 @@ function _buildMolShellGroups(elecs) {
 // Advance orbit3D physics for all molecule sites (same physics as stepOrbit3D).
 function stepMolOrbit3D(dt = 1) {
   for (const site of molSites) {
-    if (!site.shellGroups) continue;
+    const _grps = site.trailShellGroups ?? site.shellGroups;
+    if (!_grps) continue;
     const occupied = [...new Set(site.elecs.map(e => e.shell))];
     for (const s of occupied) {
       const sp = orbShellSpeed[s] ?? 8, radAmp = orbShellRadAmp[s] ?? 0.2;
       const wandDeg = orbShellWander[s] ?? 45, maxLen = orbShellTrailLen[s] ?? 140;
       const phStep = 0.05 * sp * dt;
-      for (const grp of site.shellGroups[s]) {
+      for (const grp of _grps[s]) {
         grp.radPh += 0.036 * sp * dt;
         const r = 1 + radAmp * Math.sin(grp.radPh);
         const precSpeed = 0.006 * sp * (wandDeg / 45) * dt;
@@ -4920,6 +5019,58 @@ function stepMolOrbit3D(dt = 1) {
       }
     }
   }
+}
+
+function _stepMolBondElecOne(bond, e) {
+  const { cycle, gIsB, rG, rL, d, trailLen, spd0 } = bond;
+  const sep = 2 * d;
+  if (e.visit !== e.prevVisit) {
+    e.prevVisit = e.visit;
+    e.targetR = (Math.random() * 2 - 1) * bondRadial;
+    e.targetW = -Math.random() * Math.abs(bondOrbitWander);
+  }
+  e.effR += (e.targetR - e.effR) * 0.08;
+  e.effW += (e.targetW - e.effW) * 0.08;
+  const visitType = cycle[e.visit % cycle.length];
+  const isFig8 = visitType.startsWith('fig8');
+  const isG = visitType.endsWith('-G');
+  const maxPhase = isFig8 ? Math.PI : 2 * Math.PI;
+  const a_curr = (isG ? rG : rL) * (1 + e.effR) + d;
+  let spd = spd0 * (d / a_curr);
+  if (isFig8) {
+    const localT = isG ? (gIsB ? e.phase : e.phase + Math.PI) : (gIsB ? e.phase + Math.PI : e.phase);
+    spd *= bondCrossSlowMin + (1 - bondCrossSlowMin) * Math.abs(Math.sin(localT));
+  }
+  const p0 = _orbitPos(visitType, e.phase, gIsB, rG, rL, d, e.effR, e.effW);
+  const phaseNext = e.phase + spd;
+  const p1 = phaseNext >= maxPhase
+    ? _orbitPos(cycle[(e.visit + 1) % cycle.length], phaseNext - maxPhase, gIsB, rG, rL, d, e.effR, e.effW)
+    : _orbitPos(visitType, phaseNext, gIsB, rG, rL, d, e.effR, e.effW);
+  const idealVX = p1.lx - p0.lx, idealVY = p1.ly - p0.ly;
+  e.phase += spd;
+  if (e.phase >= maxPhase) {
+    e.phase -= maxPhase;
+    const prevType = visitType;
+    e.visit = (e.visit + 1) % cycle.length;
+    if (prevType.startsWith('sphere') && cycle[e.visit].startsWith('fig8')) e.softSteerN = 18;
+  }
+  if (e.softSteerN > 0) e.softSteerN--;
+  const _sf = e.softSteerN / 18;
+  const sr = e.fracs.length === 0 ? 1.0
+    : e.softSteerN > 0 ? bondOrbitSteer * (0.08 + 0.92 * (1 - _sf))
+    : bondOrbitSteer;
+  e.vx += sr * (idealVX - e.vx);
+  e.vy += sr * (idealVY - e.vy);
+  e.x  += e.vx + 0.06 * (p0.lx - e.x);
+  e.y  += e.vy + 0.06 * (p0.ly - e.y);
+  e.fracs.push({ frac: 0.5 + e.x / sep, perp: e.y / sep });
+  if (e.fracs.length > trailLen) e.fracs.splice(0, e.fracs.length - trailLen);
+}
+
+function stepMolBondElecs() {
+  for (const bond of molBondElecs)
+    for (const e of bond.elecs)
+      _stepMolBondElecOne(bond, e);
 }
 
 // Trails view for molecules: same 3D spherical orbits as the Bonds Trails tab.
@@ -4944,16 +5095,64 @@ function drawMolTrails(ctx) {
     ctx.save();
     ctx.translate(sx, sy);
     ctx.scale(molZoom, molZoom);
-    ctx.translate(-site.ap.cx, -site.ap.cy);
     drawParticles(site.ap.particles, 0, 1, ctx);
     ctx.restore();
   }
 
   // Draw orbits centered at each site's screen position
+  // trailShellGroups excludes bond electrons so they only appear as bond trails below
   for (const site of molSites) {
     const sx = centerX + site.cx_rel * molZoom;
     const sy = centerY + site.cy_rel * molZoom;
-    if (site.shellGroups) _drawOrbit3DCore(ctx, sx, sy, site.elecs, site.shellGroups, site.Z);
+    const _groups = site.trailShellGroups ?? site.shellGroups;
+    if (_groups) _drawOrbit3DCore(ctx, sx, sy, site.elecs, _groups, site.Z, site.lostOuter, site.shellR);
+  }
+
+  // Bond electron trails — same batched bucket rendering as the single-atom bond tabs.
+  // fracs are stored in bond-local coords (frac=along-bond, perp=perpendicular), projected
+  // to screen using the actual bond direction so angled bonds (H2O) work correctly.
+  if (molBondElecs.length) {
+    const LIGHT = document.body.classList.contains('screenshot-mode');
+    const _nB = _quality === 'hi-res' ? 32 : _quality === 'detailed' ? 4 : 2;
+    const _trailMaxAlpha = LIGHT ? 0.92 : 0.75;
+    const colorPts = new Map();
+    for (const bond of molBondElecs) {
+      const siteA = molSites[bond.siteAIdx], siteB = molSites[bond.siteBIdx];
+      const sxA = centerX + siteA.cx_rel * molZoom, syA = centerY + siteA.cy_rel * molZoom;
+      const sxB = centerX + siteB.cx_rel * molZoom, syB = centerY + siteB.cy_rel * molZoom;
+      const dx = sxB - sxA, dy = syB - syA; // bond vector in screen pixels
+      for (const e of bond.elecs) {
+        if (e.fracs.length < 2) continue;
+        const col = LIGHT ? _darkenHex(e.color) : e.color;
+        if (!colorPts.has(col)) colorPts.set(col, []);
+        // Project bond-local (frac, perp) → screen: along-bond is (dx,dy), perp is (-dy,dx)
+        colorPts.get(col).push(e.fracs.map(f => [sxA + f.frac * dx - f.perp * dy, syA + f.frac * dy + f.perp * dx]));
+      }
+    }
+    ctx.lineWidth = 1.5; ctx.lineCap = 'round';
+    for (const [col, ptsList] of colorPts) {
+      ctx.strokeStyle = col;
+      for (let b = 0; b < _nB; b++) {
+        const _a = ((b + 1) / _nB) * _trailMaxAlpha;
+        ctx.globalAlpha = (_nB !== 32 && b === 0) ? _a * 0.5 : _a;
+        ctx.beginPath();
+        for (const pts of ptsList) {
+          const np = pts.length;
+          const i0 = Math.round(b / _nB * (np - 1));
+          const i1 = Math.round((b + 1) / _nB * (np - 1));
+          if (i1 <= i0) continue;
+          ctx.moveTo(pts[i0][0], pts[i0][1]);
+          const mid0x = (pts[i0][0] + pts[Math.min(i0+1,np-1)][0]) / 2;
+          const mid0y = (pts[i0][1] + pts[Math.min(i0+1,np-1)][1]) / 2;
+          ctx.lineTo(mid0x, mid0y);
+          for (let i = i0 + 1; i < i1; i++)
+            ctx.quadraticCurveTo(pts[i][0], pts[i][1], (pts[i][0]+pts[i+1][0])/2, (pts[i][1]+pts[i+1][1])/2);
+          ctx.lineTo(pts[i1][0], pts[i1][1]);
+        }
+        ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
   }
 
   viewZoom = _savedVZ;
@@ -4973,6 +5172,7 @@ function idleParticleLoop(now) {
         _orb3dLast = now;
         stepMolOrbit3D(_dt);
       }
+      if (!orb3dPaused) stepMolBondElecs();
     } else stepMoleculeElectrons();
   } else {
     if (_isOrbit) {
@@ -5078,9 +5278,23 @@ document.querySelectorAll('[data-mode]').forEach(btn => {
     panOffsetY = 0;
     if (currentMode === 'molecules') {
       if (!molSites.length) initMolecule();
+      else {
+        // Re-highlight PT for the current molecule when returning to molecules mode
+        const _molZs = [...new Set(molSites.map(s => s.Z))];
+        document.querySelectorAll('[data-ptcell]').forEach(el => {
+          el.style.color = 'rgba(200,190,255,0.22)'; el.style.background = 'transparent';
+        });
+        _molZs.forEach(Z => {
+          const el = document.querySelector(`[data-ptcell="${Z}"]`);
+          if (!el) return;
+          const c = Z === 1 ? '#aaaaaa' : _valenceColorForZ(Z);
+          el.style.color = c; el.style.background = c + '28';
+        });
+      }
       viewZoom = zoomFromSlider(0);
       document.getElementById('zoomSlider').value = 0;
     } else {
+      if (_reapplyCurrentBond) _reapplyCurrentBond();
       if (autoScaleZoom) {
         applyAutoScale();
       } else {
@@ -5337,6 +5551,36 @@ var syncShellDevSliders = function() {}; // populated by _wireDevSliders once sh
       }
       orb3dShellGroupsB[outerS].push(_mkGrp(null));       // green — restores subtracted slot
       orb3dShellGroupsB[outerS].push(_mkGrp('#4488ff'));  // blue  — Na's transferred electron
+      orb3dShellCountsB[outerS] += 2;
+    }
+    // Na-O: subtract removes 1 from 6 → 5 red groups. Add 1 red + 1 blue = 6 red + 1 blue.
+    if (zA === 11 && zB === 8 && animParentB && electronsB.length) {
+      const outerS = Math.max(...electronsB.map(e => e.shell));
+      const _mkGrpO = colorOverride => {
+        const ax = _o3RandAxis(), ref = Math.abs(ax[0]) < 0.9 ? [1,0,0] : [0,1,0];
+        const g = { count: 1, phase: Math.random() * Math.PI * 2, phOff: [0],
+          radPh: Math.random() * Math.PI * 2, ax, e1: _o3Norm(_o3Cross(ax, ref)),
+          rot: _o3RandAxis(), trails: [[]] };
+        if (colorOverride) g.colorOverride = colorOverride;
+        return g;
+      };
+      orb3dShellGroupsB[outerS].push(_mkGrpO(null));       // red  — restores subtracted slot
+      orb3dShellGroupsB[outerS].push(_mkGrpO('#4488ff'));  // blue — Na's transferred electron
+      orb3dShellCountsB[outerS] += 2;
+    }
+    // K-Cl: subtract removes 1 from 7 → 6 green groups. Add 1 green + 1 pink = 7 green + 1 pink.
+    if (zA === 19 && zB === 17 && animParentB && electronsB.length) {
+      const outerS = Math.max(...electronsB.map(e => e.shell));
+      const _mkGrpKCl = colorOverride => {
+        const ax = _o3RandAxis(), ref = Math.abs(ax[0]) < 0.9 ? [1,0,0] : [0,1,0];
+        const g = { count: 1, phase: Math.random() * Math.PI * 2, phOff: [0],
+          radPh: Math.random() * Math.PI * 2, ax, e1: _o3Norm(_o3Cross(ax, ref)),
+          rot: _o3RandAxis(), trails: [[]] };
+        if (colorOverride) g.colorOverride = colorOverride;
+        return g;
+      };
+      orb3dShellGroupsB[outerS].push(_mkGrpKCl(null));         // green — restores subtracted Cl slot
+      orb3dShellGroupsB[outerS].push(_mkGrpKCl('#ff66cc'));    // pink  — K's transferred electron
       orb3dShellCountsB[outerS] += 2;
     }
     _initBondDots();
