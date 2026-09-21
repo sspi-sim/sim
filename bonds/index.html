@@ -831,7 +831,7 @@
     </div>
     <div style="display:flex;align-items:center;gap:6px;margin-left:auto;">
       <span id="benchScore" class="dev-ui" style="font-size:10px;font-weight:600;font-variant-numeric:tabular-nums;color:#eeff00;white-space:nowrap;opacity:0.75;"></span>
-      <span style="font-size:10px;font-weight:600;letter-spacing:0.06em;color:rgba(255,255,255,0.45);white-space:nowrap;">Field Test Version 1.8</span>
+      <span style="font-size:10px;font-weight:600;letter-spacing:0.06em;color:rgba(255,255,255,0.45);white-space:nowrap;">Field Test Version 1.10</span>
       <select id="qualitySelect">
         <option value="hi-res">Hi-res</option>
         <option value="detailed">Detailed</option>
@@ -867,9 +867,9 @@
         <option value="19,17">K–Cl</option>
         <option value="50,17">Sn–Cl</option>
         <option value="82,17">Pb–Cl</option>
-        <option value="8,1">H–O</option>
+        <option value="8,1" selected>H–O</option>
         <option value="6,8">C–O</option>
-        <option value="11,8" selected>Na–O</option>
+        <option value="11,8">Na–O</option>
         <option value="82,8">Pb–O</option>
         <option value="6,1">C–H</option>
         <option value="6,6">C–C</option>
@@ -4276,7 +4276,9 @@ function draw() {
     : bondShellsSubtractAllA ? electrons.filter(e => e.shell !== _outerShellA)
     : electrons.slice(0, -1);
   // Ghost shell: draw the empty outer ring when subtraction empties the outer shell (Cu, H, etc.)
-  const _ghostA = (_subtractA && electrons.length && !_elecsA.some(e => e.shell === _outerShellA)) ? [_outerShellA] : [];
+  // Ionic bonds in shells tab: outer shell is fully donated — suppress the ghost ring entirely.
+  const _ionicShells = currentTab === 'shells' && !!bondIonicAnchorA;
+  const _ghostA = (!_ionicShells && _subtractA && electrons.length && !_elecsA.some(e => e.shell === _outerShellA)) ? [_outerShellA] : [];
   _drawAtomInCtx(ctx, animParent, _elecsA, customZ, vz, _hideOuter, _subtractA, _ghostA);
 
   // ── Atom B ──────────────────────────────────────────────────────────────────
