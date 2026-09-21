@@ -4229,7 +4229,7 @@ nucleusIconLoop(0);
 drawOutlineIcon();
 
 // ─── Main draw function ─────────────────────────────────────────────────────
-function _drawAtomInCtx(ctx, ap, elecs, Z, vz, hideOuter = false, bondSubtracted = false, ghostShells = []) {
+function _drawAtomInCtx(ctx, ap, elecs, Z, vz, hideOuter = false, bondSubtracted = false, ghostShells = [], forceInnerColor = false) {
   const cx=ap.cx, cy=ap.cy;
   if (!showParticles) drawCloudOutline(cx, cy, ap.sphereR);
   else {
@@ -4239,7 +4239,7 @@ function _drawAtomInCtx(ctx, ap, elecs, Z, vz, hideOuter = false, bondSubtracted
     drawParticles(ap.particles, 1);
     _flatFill = _svFlat; _quality = _svQ;
   }
-  drawElectronsShellsFor(ctx, elecs, cx, cy, Z, hideOuter, bondSubtracted, ghostShells);
+  drawElectronsShellsFor(ctx, elecs, cx, cy, Z, hideOuter, bondSubtracted, ghostShells, forceInnerColor);
 }
 
 function draw() {
@@ -4279,7 +4279,7 @@ function draw() {
   // Ionic bonds in shells tab: outer shell is fully donated — suppress the ghost ring entirely.
   const _ionicShells = currentTab === 'shells' && !!bondIonicAnchorA;
   const _ghostA = (!_ionicShells && _subtractA && electrons.length && !_elecsA.some(e => e.shell === _outerShellA)) ? [_outerShellA] : [];
-  _drawAtomInCtx(ctx, animParent, _elecsA, customZ, vz, _hideOuter, _subtractA, _ghostA);
+  _drawAtomInCtx(ctx, animParent, _elecsA, customZ, vz, _hideOuter, _subtractA, _ghostA, _ionicShells);
 
   // ── Atom B ──────────────────────────────────────────────────────────────────
   if (animParentB) {
