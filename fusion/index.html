@@ -907,7 +907,7 @@
 
 <!-- Theme color row — floats at top of bar chart panel (fusion tab only) -->
 <div id="v14ColorRow" style="position:fixed;right:0;top:0;width:320px;display:none;z-index:50;justify-content:center;align-items:center;gap:10px;padding:7px 0;box-sizing:border-box;background:rgba(4,3,20,0.88);border-bottom:1px solid rgba(0,180,255,0.15);">
-  <span style="font-size:10px;font-weight:600;letter-spacing:0.06em;color:rgba(255,255,255,0.45);white-space:nowrap;">Field Test Version 2.2</span>
+  <span style="font-size:10px;font-weight:600;letter-spacing:0.06em;color:rgba(255,255,255,0.45);white-space:nowrap;">Field Test Version 2.3</span>
   <select id="qualitySelect">
     <option value="hi-res">Hi-res</option>
     <option value="detailed">Detailed</option>
@@ -2726,18 +2726,19 @@ function draw() {
     ctx.fillStyle = baseGrad;
     ctx.beginPath(); ctx.arc(jx, jy, R * 1.1, 0, Math.PI * 2); ctx.fill();
 
-    // Inner glow with neon shadow
+    // Halo circle — replaces Gaussian shadow blur, same visual weight without Skia cost
+    ctx.globalAlpha = 0.15;
+    ctx.fillStyle   = core;
+    ctx.beginPath(); ctx.arc(jx, jy, R * 1.6, 0, Math.PI * 2); ctx.fill();
+
+    // Inner glow
     const innerGlow = ctx.createRadialGradient(jx, jy, 0, jx, jy, R);
     innerGlow.addColorStop(0,   core);
     innerGlow.addColorStop(0.5, core);
     innerGlow.addColorStop(1,   'rgba(0,0,0,0)');
-    ctx.save();
-    ctx.shadowColor = core;
-    ctx.shadowBlur  = 8;
     ctx.globalAlpha = 0.82;
     ctx.fillStyle   = innerGlow;
     ctx.beginPath(); ctx.arc(jx, jy, R, 0, Math.PI * 2); ctx.fill();
-    ctx.restore();
     ctx.globalAlpha = 1;
 
     // + label on protons only
@@ -4239,6 +4240,11 @@ function stepTempPhysics() {
 
 function drawTempProtonAt(x, y) {
   const R = TEMP_R;
+  // Halo circle — drawn behind particle, replaces shadowBlur
+  ctx.globalAlpha = 0.15;
+  ctx.fillStyle   = '#ff2d78';
+  ctx.beginPath(); ctx.arc(x, y, R * 1.6, 0, Math.PI * 2); ctx.fill();
+  ctx.globalAlpha = 1;
   // Flat base circle — solid mid color, soft edge fade (v11 style)
   const baseR = R * 1.1;
   const baseGrad = ctx.createRadialGradient(x, y, 0, x, y, baseR);
@@ -4320,10 +4326,7 @@ function drawTemp() {
       visX[j] += nx * push;  visY[j] += ny * push;
     }
   }
-  ctx.save();
-  ctx.shadowColor = '#ff2d78'; ctx.shadowBlur = 12;
   for (let i = 0; i < N; i++) drawTempProtonAt(visX[i], visY[i]);
-  ctx.restore();
 
   // Total force arrows (drawn on top)
   if (showTotalForce) drawTempForceArrows();
@@ -4742,7 +4745,7 @@ document.getElementById('qualitySelect').addEventListener('change', function() {
 function getBugState() {
   return {
     sim:          'fusion',
-    version:      '2.2',
+    version:      '2.3',
     tab:          currentTab,
     left:         leftChoice,
     right:        rightChoice,
