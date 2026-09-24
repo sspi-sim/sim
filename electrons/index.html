@@ -1079,6 +1079,8 @@ let heatmapDirty    = true;
 
 // ── Quality selector ──────────────────────────────────────────────────────────
 let _quality = 'hi-res';  // 'hi-res' | 'detailed' | 'simple'
+let _resetCount  = 0;
+let _benchmarkMs = 0;
 
 // ── Dev perf toggles (driven by _applyQuality) ────────────────────────────────
 let _flatFill = true;
@@ -4583,6 +4585,7 @@ initNuclei();
 // Simple default: hi-res option removed.
 (function _startupBenchmark() {
   const ms = _runPerfBenchmark();
+  _benchmarkMs = ms;
   const msT = _runTrailBenchmark();
   const el = document.getElementById('benchScore');
   if (el) el.textContent = `grad ${ms.toFixed(1)}ms  trail ${msT.toFixed(1)}ms`;
@@ -4684,9 +4687,15 @@ function getBugState() {
   return {
     sim:       'electrons',
     version:   '1.18',
-    nucleus:   selectedNucleusKey,
-    viewZoom:  +viewZoom.toFixed(3),
-    actionLog: actionLog.slice(),
+    nucleus:      selectedNucleusKey,
+    viewZoom:     +viewZoom.toFixed(3),
+    actionLog:    actionLog.slice(),
+    resetCount:   _resetCount,
+    quality:      _quality,
+    benchmarkMs:  _benchmarkMs,
+    activeLoops:  { idleJitter: !!idleParticleRAF, loop: false, tempLoop: false, iconAnim: !!_nucleusIconRAF, replay: false },
+    heapMB:       Math.round((performance.memory?.usedJSHeapSize || 0) / 1048576),
+    canvasSize:   canvas.width + 'x' + canvas.height,
   };
 }
 document.getElementById('bugReportBtn').addEventListener('click', e => {

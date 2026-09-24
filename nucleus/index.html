@@ -1120,6 +1120,8 @@ const neutronIconCanvas = document.getElementById('neutronIconCanvas');
 let particles = [];
 let running = false;
 let _quality = 'hi-res';  // 'hi-res' | 'detailed' | 'simple'
+let _resetCount  = 0;
+let _benchmarkMs = 0;
 let animId = null;
 
 // ── Perf / lag detection ──────────────────────────────────────────────────────
@@ -1741,6 +1743,7 @@ function buildRandomProtons(n) {
 //                        Add buttons and neutron slider
 // ============================================================
 function resetSim() {
+  _resetCount++;
   running = false;
   replaying = false;
   replayAccum = 0;
@@ -4282,6 +4285,7 @@ function _runPerfBenchmark() {
 
 (function _startupBenchmark() {
   const ms = _runPerfBenchmark();
+  _benchmarkMs = ms;
   if (ms > 6) {
     const hiOpt = document.querySelector('#qualitySelect option[value="hi-res"]');
     if (hiOpt) hiOpt.remove();
@@ -4377,7 +4381,13 @@ function getBugState() {
       t: p.type, x: Math.round(p.x), y: Math.round(p.y),
       vx: +p.vx.toFixed(3), vy: +p.vy.toFixed(3),
     })),
-    actionLog: actionLog.slice(),
+    actionLog:    actionLog.slice(),
+    resetCount:   _resetCount,
+    quality:      _quality,
+    benchmarkMs:  _benchmarkMs,
+    activeLoops:  { idleJitter: false, loop: !!animId, tempLoop: false, iconAnim: !!_iconAnimRAF, replay: false },
+    heapMB:       Math.round((performance.memory?.usedJSHeapSize || 0) / 1048576),
+    canvasSize:   canvas.width + 'x' + canvas.height,
   };
 }
 document.getElementById('bugReportBtn').addEventListener('click', e => {

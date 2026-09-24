@@ -1184,6 +1184,8 @@ let heatmapDirty    = true;
 
 // ── Quality selector ──────────────────────────────────────────────────────────
 let _quality = 'hi-res';  // 'hi-res' | 'simple'
+let _resetCount  = 0;
+let _benchmarkMs = 0;
 
 // ── Dev perf toggles (driven by _applyQuality) ────────────────────────────────
 let _flatFill = true;
@@ -5712,6 +5714,7 @@ initNuclei();
 //   > 6ms / 100p → simple   (> ~13ms projected — minimal rendering)
 (function _startupBenchmark() {
   const ms = _runPerfBenchmark();
+  _benchmarkMs = ms;
   if (ms > 6) {
     const hiOpt = document.querySelector('#qualitySelect option[value="hi-res"]');
     if (hiOpt) hiOpt.remove();
@@ -5824,6 +5827,12 @@ function getBugState() {
     nucleus:      selectedNucleusKey,
     viewZoom:     +viewZoom.toFixed(3),
     actionLog:    actionLog.slice(),
+    resetCount:   _resetCount,
+    quality:      _quality,
+    benchmarkMs:  _benchmarkMs,
+    activeLoops:  { idleJitter: !!idleParticleRAF, loop: false, tempLoop: false, iconAnim: !!_nucleusIconRAF, replay: false },
+    heapMB:       Math.round((performance.memory?.usedJSHeapSize || 0) / 1048576),
+    canvasSize:   canvas.width + 'x' + canvas.height,
   };
 }
 document.getElementById('bugReportBtn').addEventListener('click', e => {
