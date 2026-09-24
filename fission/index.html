@@ -897,7 +897,7 @@
       <button class="tab-btn active" data-tab="fission">Fission</button>
     </div>
     <div style="display:flex;align-items:center;gap:6px;margin-left:auto;">
-      <span style="font-size:10px;font-weight:600;letter-spacing:0.06em;color:rgba(255,255,255,0.45);white-space:nowrap;">Field Test Version 2.2</span>
+      <span style="font-size:10px;font-weight:600;letter-spacing:0.06em;color:rgba(255,255,255,0.45);white-space:nowrap;">Field Test Version 2.3</span>
       <select id="qualitySelect">
         <option value="hi-res">Hi-res</option>
         <option value="detailed">Detailed</option>
@@ -1562,11 +1562,14 @@ function drawNeutron(x, y) {
     baseGrad.addColorStop(0, '#70707f'); baseGrad.addColorStop(0.82, '#70707f'); baseGrad.addColorStop(1, 'rgba(0,0,0,0)');
     ctx.fillStyle = baseGrad;
     ctx.beginPath(); ctx.arc(x, y, R * 1.1, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 0.15;
+    ctx.fillStyle   = '#b0b0c4';
+    ctx.beginPath(); ctx.arc(x, y, R * 1.6, 0, Math.PI * 2); ctx.fill();
     const innerGlow = ctx.createRadialGradient(x, y, 0, x, y, R);
     innerGlow.addColorStop(0, '#b0b0c4'); innerGlow.addColorStop(0.5, '#b0b0c4'); innerGlow.addColorStop(1, 'rgba(0,0,0,0)');
-    ctx.save(); ctx.shadowColor = '#b0b0c4'; ctx.shadowBlur = _quality === 'simple' ? 0 : 8; ctx.globalAlpha = 0.82;
+    ctx.globalAlpha = 0.82;
     ctx.fillStyle = innerGlow; ctx.beginPath(); ctx.arc(x, y, R, 0, Math.PI * 2); ctx.fill();
-    ctx.restore(); ctx.globalAlpha = 1;
+    ctx.globalAlpha = 1;
   } else {
     drawNeutronOutline(x, y);
   }
@@ -1635,18 +1638,19 @@ function drawParticles(particles, jitterScale = 1, radiusScale = 1, drawCtx = ct
       dc.fillStyle = baseGrad;
       dc.beginPath(); dc.arc(px, py, R * 1.1, 0, Math.PI * 2); dc.fill();
 
-      // Inner glow with shadowBlur for fuzzy halo
+      // Halo circle — replaces Gaussian shadow blur
+      dc.globalAlpha = 0.15;
+      dc.fillStyle   = core;
+      dc.beginPath(); dc.arc(px, py, R * 1.6, 0, Math.PI * 2); dc.fill();
+
+      // Inner glow
       const innerGlow = dc.createRadialGradient(px, py, 0, px, py, R);
       innerGlow.addColorStop(0,   core);
       innerGlow.addColorStop(0.5, core);
       innerGlow.addColorStop(1,   'rgba(0,0,0,0)');
-      dc.save();
-      dc.shadowColor = core;
-      dc.shadowBlur  = _quality === 'simple' ? 0 : 8;
       dc.globalAlpha = 0.82;
       dc.fillStyle = innerGlow;
       dc.beginPath(); dc.arc(px, py, R, 0, Math.PI * 2); dc.fill();
-      dc.restore();
       dc.globalAlpha = 1;
     }
 
@@ -2927,13 +2931,12 @@ function drawNucleusIcon(canvas, particles, scale = 1.0) {
     innerGlow.addColorStop(0,   core);
     innerGlow.addColorStop(0.5, core);
     innerGlow.addColorStop(1,   'rgba(0,0,0,0)');
-    c.save();
-    c.shadowColor = core;
-    c.shadowBlur  = 4 * scale;
+    c.globalAlpha = 0.15;
+    c.fillStyle   = core;
+    c.beginPath(); c.arc(px, py, R * 1.6, 0, Math.PI * 2); c.fill();
     c.globalAlpha = 0.82;
     c.fillStyle = innerGlow;
     c.beginPath(); c.arc(px, py, R, 0, Math.PI * 2); c.fill();
-    c.restore();
     c.globalAlpha = 1;
   }
 }
@@ -2984,9 +2987,12 @@ function drawMiniNucleusIcon(canvas) {
     c.fillStyle = baseGrad; c.beginPath(); c.arc(px, py, R * 1.1, 0, Math.PI * 2); c.fill();
     const innerGlow = c.createRadialGradient(px, py, 0, px, py, R);
     innerGlow.addColorStop(0, core); innerGlow.addColorStop(0.5, core); innerGlow.addColorStop(1, 'rgba(0,0,0,0)');
-    c.save(); c.shadowColor = core; c.shadowBlur = 3; c.globalAlpha = 0.82;
+    c.globalAlpha = 0.15;
+    c.fillStyle   = core;
+    c.beginPath(); c.arc(px, py, R * 1.6, 0, Math.PI * 2); c.fill();
+    c.globalAlpha = 0.82;
     c.fillStyle = innerGlow; c.beginPath(); c.arc(px, py, R, 0, Math.PI * 2); c.fill();
-    c.restore(); c.globalAlpha = 1;
+    c.globalAlpha = 1;
   }
 }
 
@@ -4113,7 +4119,7 @@ document.addEventListener('visibilitychange', () => {
 function getBugState() {
   return {
     sim:          'fission',
-    version:      '2.2',
+    version:      '2.3',
     tab:          currentTab,
     neutronState,
     wobbleMode,
