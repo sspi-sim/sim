@@ -2712,10 +2712,6 @@ function _buildParticleSprites() {
     bg.addColorStop(1,    'rgba(0,0,0,0)');
     dc.fillStyle = bg;
     dc.beginPath(); dc.arc(half, half, R * 1.1, 0, Math.PI * 2); dc.fill();
-    dc.globalAlpha = 0.15;
-    dc.fillStyle   = core;
-    dc.beginPath(); dc.arc(half, half, R * 1.6, 0, Math.PI * 2); dc.fill();
-    dc.globalAlpha = 1;
     const ig = dc.createRadialGradient(half, half, 0, half, half, R);
     ig.addColorStop(0,   core);
     ig.addColorStop(0.5, core);
@@ -2745,10 +2741,6 @@ function _buildTempSprite() {
   const oc = document.createElement('canvas');
   oc.width = oc.height = size;
   const dc = oc.getContext('2d');
-  dc.globalAlpha = 0.15;
-  dc.fillStyle   = '#ff2d78';
-  dc.beginPath(); dc.arc(half, half, R * 1.6, 0, Math.PI * 2); dc.fill();
-  dc.globalAlpha = 1;
   const bg = dc.createRadialGradient(half, half, 0, half, half, R * 1.1);
   bg.addColorStop(0,    '#ff1a65');
   bg.addColorStop(0.82, '#ff1a65');
