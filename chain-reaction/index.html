@@ -1133,9 +1133,9 @@ function drawCloudOutline(cx, cy, sphereR, c = ctx) {
   const LIGHT = document.body.classList.contains('screenshot-mode');
   c.save();
   c.shadowColor = LIGHT ? 'rgba(0,0,0,0)' : 'rgba(80,160,255,0.9)';
-  c.shadowBlur  = (LIGHT || _quality === 'simple') ? 0 : 22;
+  c.shadowBlur  = (LIGHT || _quality !== 'hi-res') ? 0 : 22;
   c.strokeStyle = LIGHT ? '#333' : 'rgba(160,215,255,1)';
-  c.lineWidth   = LIGHT ? 2.5 : (_quality === 'simple' ? 2 : 4);
+  c.lineWidth   = LIGHT ? 2.5 : (_quality !== 'hi-res' ? 2 : 4);
   c.beginPath();
 
   c.moveTo(arcs[0].cx + R * Math.cos(arcs[0].startAngle),
@@ -1224,9 +1224,9 @@ function drawFissionOutline(cx1, cy1, r1, cx2, cy2, r2, c = ctx) {
   const LIGHT = document.body.classList.contains('screenshot-mode');
   c.save();
   c.shadowColor = LIGHT ? 'rgba(0,0,0,0)' : 'rgba(80,160,255,0.9)';
-  c.shadowBlur  = (LIGHT || _quality === 'simple') ? 0 : 22;
+  c.shadowBlur  = (LIGHT || _quality !== 'hi-res') ? 0 : 22;
   c.strokeStyle = LIGHT ? '#333' : 'rgba(160,215,255,1)';
-  c.lineWidth   = LIGHT ? 2.5 : (_quality === 'simple' ? 2 : 4);
+  c.lineWidth   = LIGHT ? 2.5 : (_quality !== 'hi-res' ? 2 : 4);
   c.beginPath();
 
   c.moveTo(arcs[0].cx + R * Math.cos(arcs[0].startAngle),
@@ -1246,9 +1246,9 @@ function drawNeutronOutline(x, y) {
   const LIGHT = document.body.classList.contains('screenshot-mode');
   ctx.save();
   ctx.shadowColor = LIGHT ? 'rgba(0,0,0,0)' : 'rgba(80,160,255,0.9)';
-  ctx.shadowBlur  = (LIGHT || _quality === 'simple') ? 0 : 22;
+  ctx.shadowBlur  = (LIGHT || _quality !== 'hi-res') ? 0 : 22;
   ctx.strokeStyle = LIGHT ? '#333' : 'rgba(160,215,255,1)';
-  ctx.lineWidth   = LIGHT ? 2.5 : (_quality === 'simple' ? 2 : 4);
+  ctx.lineWidth   = LIGHT ? 2.5 : (_quality !== 'hi-res' ? 2 : 4);
   ctx.beginPath();
   ctx.arc(x, y, R, 0, Math.PI * 2);
   ctx.stroke();

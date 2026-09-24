@@ -2834,7 +2834,7 @@ function drawArrowOnCtx(c, fromX, fromY, nx, ny, len, color, lw = 2) {
   const baseX = tipX - nx * HEAD, baseY = tipY - ny * HEAD;
   c.strokeStyle = color; c.fillStyle = color;
   c.save();
-  c.shadowColor = color; c.shadowBlur = _quality === 'simple' ? 0 : 8;
+  c.shadowColor = color; c.shadowBlur = _quality !== 'hi-res' ? 0 : 8;
   c.lineWidth = lw; c.globalAlpha = 0.88; c.lineCap = 'round';
   c.beginPath(); c.moveTo(fromX, fromY);
   c.quadraticCurveTo(midX, midY, baseX, baseY);

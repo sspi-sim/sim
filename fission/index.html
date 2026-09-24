@@ -1432,7 +1432,7 @@ function drawCloudOutline(cx, cy, sphereR, c = ctx) {
   const LIGHT = document.body.classList.contains('screenshot-mode');
   c.save();
   c.shadowColor = LIGHT ? 'rgba(0,0,0,0)' : 'rgba(80,160,255,0.9)';
-  c.shadowBlur  = (LIGHT || _quality === 'simple') ? 0 : 22;
+  c.shadowBlur  = (LIGHT || _quality !== 'hi-res') ? 0 : 22;
   c.strokeStyle = LIGHT ? '#333' : 'rgba(160,215,255,1)';
   c.lineWidth   = LIGHT ? 2.5 : 4;
   c.beginPath();
@@ -1523,7 +1523,7 @@ function drawFissionOutline(cx1, cy1, r1, cx2, cy2, r2, c = ctx) {
   const LIGHT = document.body.classList.contains('screenshot-mode');
   c.save();
   c.shadowColor = LIGHT ? 'rgba(0,0,0,0)' : 'rgba(80,160,255,0.9)';
-  c.shadowBlur  = (LIGHT || _quality === 'simple') ? 0 : 22;
+  c.shadowBlur  = (LIGHT || _quality !== 'hi-res') ? 0 : 22;
   c.strokeStyle = LIGHT ? '#333' : 'rgba(160,215,255,1)';
   c.lineWidth   = LIGHT ? 2.5 : 4;
   c.beginPath();
@@ -1545,7 +1545,7 @@ function drawNeutronOutline(x, y) {
   const LIGHT = document.body.classList.contains('screenshot-mode');
   ctx.save();
   ctx.shadowColor = LIGHT ? 'rgba(0,0,0,0)' : 'rgba(80,160,255,0.9)';
-  ctx.shadowBlur  = (LIGHT || _quality === 'simple') ? 0 : 22;
+  ctx.shadowBlur  = (LIGHT || _quality !== 'hi-res') ? 0 : 22;
   ctx.strokeStyle = LIGHT ? '#333' : 'rgba(160,215,255,1)';
   ctx.lineWidth   = LIGHT ? 2.5 : 4;
   ctx.beginPath();
@@ -2317,7 +2317,7 @@ function fvArrowOnCtx(c, fromX, fromY, nx, ny, len, color, lw, headLen) {
   const baseX = tipX - nx * HEAD, baseY = tipY - ny * HEAD;
   c.strokeStyle = color; c.fillStyle = color;
   c.save();
-  c.shadowColor = color; c.shadowBlur = _quality === 'simple' ? 0 : 8;
+  c.shadowColor = color; c.shadowBlur = _quality !== 'hi-res' ? 0 : 8;
   c.lineWidth = lw; c.globalAlpha = 1.0; c.lineCap = 'round';
   c.beginPath(); c.moveTo(fromX, fromY);
   c.quadraticCurveTo(midX, midY, baseX, baseY);
@@ -3802,7 +3802,7 @@ function drawEnergyGraph() {
 
   // Bottom axis — always visible
   egCtx.save();
-  egCtx.shadowBlur  = (LIGHT || _quality === 'simple') ? 0 : 6;
+  egCtx.shadowBlur  = (LIGHT || _quality !== 'hi-res') ? 0 : 6;
   egCtx.shadowColor = _axisGlow;
   egCtx.strokeStyle = _axisCol;
   egCtx.lineWidth   = 1;
@@ -3834,7 +3834,7 @@ function drawEnergyGraph() {
     }
     // Draw up to the high-water mark — traces live, stays drawn after scrub
     if (_quality === 'hi-res') strokeSeg(0, revealPx, 8, 28, 0.25);
-    if (_quality !== 'simple') strokeSeg(0, revealPx, 3, 10, 0.55);
+    if (_quality === 'hi-res') strokeSeg(0, revealPx, 3, 10, 0.55);
     strokeSeg(0, revealPx, 1.5, 0, 1.00);
   }
 
@@ -3855,8 +3855,8 @@ function drawEnergyGraph() {
   // Cursor — neon white with glow (black in light mode)
   const cx = curPx;
   egCtx.save();
-  egCtx.shadowBlur  = (LIGHT || _quality === 'simple') ? 0 : 8;
-  egCtx.shadowColor = (LIGHT || _quality === 'simple') ? 'rgba(0,0,0,0)' : 'rgba(255,255,255,0.7)';
+  egCtx.shadowBlur  = (LIGHT || _quality !== 'hi-res') ? 0 : 8;
+  egCtx.shadowColor = (LIGHT || _quality !== 'hi-res') ? 'rgba(0,0,0,0)' : 'rgba(255,255,255,0.7)';
   egCtx.strokeStyle = LIGHT ? 'rgba(0,0,0,0.75)' : 'rgba(255,255,255,0.85)';
   egCtx.lineWidth   = 1;
   egCtx.beginPath(); egCtx.moveTo(cx, 0); egCtx.lineTo(cx, H); egCtx.stroke();

@@ -2021,7 +2021,7 @@ function drawPhoton() {
   const sp = Math.sqrt(photon.vx * photon.vx + photon.vy * photon.vy);
   if (sp < 0.01) return;
 
-  if (_quality === 'simple') {
+  if (_quality !== 'hi-res') {
     ctx.globalAlpha = fade;
     ctx.fillStyle = 'rgba(210,65,255,1)';
     ctx.beginPath(); ctx.arc(photon.x, photon.y, 8, 0, Math.PI * 2); ctx.fill();
@@ -2307,7 +2307,7 @@ function drawBarChart() {
 
   // Left border glow
   ctx.save();
-  ctx.shadowColor = LIGHT ? 'rgba(0,0,0,0)' : 'rgba(0,200,255,0.4)'; ctx.shadowBlur = (LIGHT || _quality === 'simple') ? 0 : 12;
+  ctx.shadowColor = LIGHT ? 'rgba(0,0,0,0)' : 'rgba(0,200,255,0.4)'; ctx.shadowBlur = (LIGHT || _quality !== 'hi-res') ? 0 : 12;
   ctx.strokeStyle = LIGHT ? 'rgba(0,0,0,0.20)' : 'rgba(0,180,255,0.25)'; ctx.lineWidth = 1;
   ctx.beginPath(); ctx.moveTo(gx, gy); ctx.lineTo(gx, gy + H); ctx.stroke();
   ctx.restore();
@@ -2378,7 +2378,7 @@ function drawBarChart() {
     ctx.lineWidth   = isBaseline ? 2 : 1.5;
     if (isBaseline) {
       ctx.shadowColor = LIGHT ? 'rgba(0,0,0,0)' : `rgba(${a2},1.0)`;
-      ctx.shadowBlur  = (LIGHT || _quality === 'simple') ? 0 : 8;
+      ctx.shadowBlur  = (LIGHT || _quality !== 'hi-res') ? 0 : 8;
     } else { ctx.shadowBlur = 0; }
     ctx.beginPath(); ctx.moveTo(gx, py); ctx.lineTo(gx + W, py); ctx.stroke();
     // Y-axis keV label (scaled mode only, skip baseline)
@@ -2433,7 +2433,7 @@ function drawBarChart() {
       // Outer glow
       ctx.save();
       if (bar.dashed) ctx.setLineDash([5, 3]);
-      ctx.shadowColor = bar.glow; ctx.shadowBlur = _quality === 'simple' ? 0 : 22;
+      ctx.shadowColor = bar.glow; ctx.shadowBlur = _quality !== 'hi-res' ? 0 : 22;
       ctx.strokeStyle = bar.color; ctx.lineWidth = 3; ctx.globalAlpha = 0.5;
       ctx.beginPath(); ctx.roundRect(x, rectY, bw, rectH, [r, r, 2, 2]); ctx.stroke();
       ctx.restore();
@@ -2441,7 +2441,7 @@ function drawBarChart() {
       // Crisp neon outline
       ctx.save();
       if (bar.dashed) ctx.setLineDash([5, 3]);
-      ctx.shadowColor = bar.glow; ctx.shadowBlur = _quality === 'simple' ? 0 : 6;
+      ctx.shadowColor = bar.glow; ctx.shadowBlur = _quality !== 'hi-res' ? 0 : 6;
       ctx.strokeStyle = bar.color; ctx.lineWidth = 3;
       ctx.beginPath(); ctx.roundRect(x, rectY, bw, rectH, [r, r, 2, 2]); ctx.stroke();
       ctx.restore();
@@ -2453,7 +2453,7 @@ function drawBarChart() {
           : fmtKeV(bar.value);
         const clipped = barTop < chartTop;  // bar taller than chart area
         ctx.save();
-        ctx.shadowColor = bar.glow; ctx.shadowBlur = _quality === 'simple' ? 0 : 6;
+        ctx.shadowColor = bar.glow; ctx.shadowBlur = _quality !== 'hi-res' ? 0 : 6;
         ctx.fillStyle   = bar.color;
         ctx.font        = 'bold 13px Lexend, sans-serif';
         ctx.textAlign   = 'center';
@@ -2469,7 +2469,7 @@ function drawBarChart() {
 
     // Label below baseline — three lines
     ctx.save();
-    ctx.shadowColor = bar.glow; ctx.shadowBlur = _quality === 'simple' ? 0 : 6;
+    ctx.shadowColor = bar.glow; ctx.shadowBlur = _quality !== 'hi-res' ? 0 : 6;
     ctx.fillStyle   = bar.color;
     ctx.font        = 'bold 18px Lexend, sans-serif';
     const words = bar.label.split(' ');
@@ -2491,7 +2491,7 @@ function drawBarChart() {
     const x2 = chartX + 2 * barW + barW * 0.9;  // right edge of SIE bar
     const centerX = (x1 + x2) / 2;
     ctx.save();
-    ctx.shadowColor = LIGHT ? 'rgba(0,0,0,0)' : 'rgba(180,140,255,0.7)'; ctx.shadowBlur = (LIGHT || _quality === 'simple') ? 0 : 8;
+    ctx.shadowColor = LIGHT ? 'rgba(0,0,0,0)' : 'rgba(180,140,255,0.7)'; ctx.shadowBlur = (LIGHT || _quality !== 'hi-res') ? 0 : 8;
     ctx.fillStyle   = LIGHT ? '#000' : 'rgba(180,140,255,0.85)';
     ctx.font        = 'bold 18px Lexend, sans-serif';
     ctx.textAlign   = 'center';
@@ -2512,7 +2512,7 @@ function drawBarChart() {
   if (coulombScatterEscape) phaseLabel = 'After';
   const pCol = LIGHT ? '#000' : (phaseColors[collisionPhase] || 'rgba(0,200,255,0.5)');
   ctx.save();
-  ctx.shadowColor = LIGHT ? 'rgba(0,0,0,0)' : pCol; ctx.shadowBlur = (LIGHT || _quality === 'simple') ? 0 : 16;
+  ctx.shadowColor = LIGHT ? 'rgba(0,0,0,0)' : pCol; ctx.shadowBlur = (LIGHT || _quality !== 'hi-res') ? 0 : 16;
   ctx.fillStyle   = pCol;
   ctx.font        = 'bold 15px Lexend, sans-serif';
   ctx.textAlign   = 'center';
@@ -2634,7 +2634,7 @@ function drawEnergyGraph() {
     egCtx.save();
     egCtx.setLineDash(dash);
     egCtx.shadowColor  = glowColor;
-    egCtx.shadowBlur   = _quality === 'simple' ? 0 : 8;
+    egCtx.shadowBlur   = _quality !== 'hi-res' ? 0 : 8;
     egCtx.strokeStyle  = color;
     egCtx.lineWidth    = 2.5;
     egCtx.globalAlpha  = 0.7;
@@ -2646,7 +2646,7 @@ function drawEnergyGraph() {
     egCtx.setLineDash(dash);
     egCtx.rect(0, 0, splitX, H);
     egCtx.clip();
-    egCtx.shadowColor = glowColor; egCtx.shadowBlur = _quality === 'simple' ? 0 : 6;
+    egCtx.shadowColor = glowColor; egCtx.shadowBlur = _quality !== 'hi-res' ? 0 : 6;
     egCtx.strokeStyle = color; egCtx.lineWidth = 1.8; egCtx.globalAlpha = 1.0;
     egCtx.stroke(path);
     egCtx.restore();
@@ -2671,7 +2671,7 @@ function drawEnergyGraph() {
     egCtx.fillStyle = _selFill;
     egCtx.fillRect(x0, 0, x1 - x0, H);
     egCtx.save();
-    egCtx.shadowColor = _selGlow; egCtx.shadowBlur = (LIGHT || _quality === 'simple') ? 0 : 4;
+    egCtx.shadowColor = _selGlow; egCtx.shadowBlur = (LIGHT || _quality !== 'hi-res') ? 0 : 4;
     egCtx.strokeStyle = _selStroke; egCtx.lineWidth = 1;
     egCtx.strokeRect(x0, 0, x1 - x0, H);
     egCtx.restore();
@@ -2680,7 +2680,7 @@ function drawEnergyGraph() {
   // Cursor line
   if (cur >= zStart && cur <= zEnd) {
     egCtx.save();
-    egCtx.shadowColor = _cursorGlow; egCtx.shadowBlur = (LIGHT || _quality === 'simple') ? 0 : 6;
+    egCtx.shadowColor = _cursorGlow; egCtx.shadowBlur = (LIGHT || _quality !== 'hi-res') ? 0 : 6;
     egCtx.strokeStyle = _cursorCol; egCtx.lineWidth = 1;
     egCtx.beginPath(); egCtx.moveTo(splitX, 0); egCtx.lineTo(splitX, H); egCtx.stroke();
     egCtx.restore();
@@ -4377,7 +4377,7 @@ function detectTempFlashes() {
       }
     }
   }
-  const flashCap = _quality === 'simple' ? 20 : 80;
+  const flashCap = _quality !== 'hi-res' ? 20 : 80;
   if (tempFlashes.length > flashCap) tempFlashes = tempFlashes.slice(-flashCap);
 }
 
@@ -4403,9 +4403,9 @@ function drawTempForceArrows() {
     const x1 = x0 + ux * scale, y1 = y0 + uy * scale;
     ctx.save();
     ctx.strokeStyle = 'rgba(100,200,255,0.85)';
-    ctx.lineWidth = _quality === 'simple' ? 2 : 4;
+    ctx.lineWidth = _quality !== 'hi-res' ? 2 : 4;
     ctx.shadowColor = 'rgba(100,200,255,0.5)';
-    ctx.shadowBlur = _quality === 'simple' ? 0 : 6;
+    ctx.shadowBlur = _quality !== 'hi-res' ? 0 : 6;
     ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
     // Arrowhead
     const hlen = 10, hwid = 6;
