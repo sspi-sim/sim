@@ -2020,6 +2020,15 @@ function drawPhoton() {
   const fade = Math.max(0, 1 - photon.age / photon.maxAge);
   const sp = Math.sqrt(photon.vx * photon.vx + photon.vy * photon.vy);
   if (sp < 0.01) return;
+
+  if (_quality === 'simple') {
+    ctx.globalAlpha = fade;
+    ctx.fillStyle = 'rgba(210,65,255,1)';
+    ctx.beginPath(); ctx.arc(photon.x, photon.y, 8, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 1;
+    return;
+  }
+
   const nx = photon.vx / sp, ny = photon.vy / sp;
   const trailLen = 50;
   const tailX = photon.x - nx * trailLen;
@@ -2680,6 +2689,88 @@ function drawEnergyGraph() {
 }
 
 // ============================================================
+//  PARTICLE SPRITES  (pre-rendered offscreen canvases)
+// ============================================================
+let _protonSprite     = null;
+let _neutronSprite    = null;
+let _tempProtonSprite = null;
+
+function _buildParticleSprites() {
+  const R    = PARTICLE_RADIUS;
+  const size = Math.ceil(R * 1.6) * 2 + 2;
+  const half = size / 2;
+
+  function make(isProton) {
+    const oc = document.createElement('canvas');
+    oc.width = oc.height = size;
+    const dc   = oc.getContext('2d');
+    const mid  = isProton ? '#ff1a65' : '#70707f';
+    const core = isProton ? '#ff80b0' : '#b0b0c4';
+    const bg = dc.createRadialGradient(half, half, 0, half, half, R * 1.1);
+    bg.addColorStop(0,    mid);
+    bg.addColorStop(0.82, mid);
+    bg.addColorStop(1,    'rgba(0,0,0,0)');
+    dc.fillStyle = bg;
+    dc.beginPath(); dc.arc(half, half, R * 1.1, 0, Math.PI * 2); dc.fill();
+    dc.globalAlpha = 0.15;
+    dc.fillStyle   = core;
+    dc.beginPath(); dc.arc(half, half, R * 1.6, 0, Math.PI * 2); dc.fill();
+    dc.globalAlpha = 1;
+    const ig = dc.createRadialGradient(half, half, 0, half, half, R);
+    ig.addColorStop(0,   core);
+    ig.addColorStop(0.5, core);
+    ig.addColorStop(1,   'rgba(0,0,0,0)');
+    dc.globalAlpha = 0.82;
+    dc.fillStyle   = ig;
+    dc.beginPath(); dc.arc(half, half, R, 0, Math.PI * 2); dc.fill();
+    dc.globalAlpha = 1;
+    if (isProton) {
+      dc.fillStyle    = 'rgba(255,255,255,0.88)';
+      dc.font         = 'bold 11px Lexend, sans-serif';
+      dc.textAlign    = 'center';
+      dc.textBaseline = 'middle';
+      dc.fillText('+', half, half + 1);
+    }
+    return oc;
+  }
+
+  _protonSprite  = make(true);
+  _neutronSprite = make(false);
+}
+
+function _buildTempSprite() {
+  const R    = TEMP_R;
+  const size = Math.ceil(R * 1.6) * 2 + 2;
+  const half = size / 2;
+  const oc = document.createElement('canvas');
+  oc.width = oc.height = size;
+  const dc = oc.getContext('2d');
+  dc.globalAlpha = 0.15;
+  dc.fillStyle   = '#ff2d78';
+  dc.beginPath(); dc.arc(half, half, R * 1.6, 0, Math.PI * 2); dc.fill();
+  dc.globalAlpha = 1;
+  const bg = dc.createRadialGradient(half, half, 0, half, half, R * 1.1);
+  bg.addColorStop(0,    '#ff1a65');
+  bg.addColorStop(0.82, '#ff1a65');
+  bg.addColorStop(1,    'rgba(0,0,0,0)');
+  dc.fillStyle = bg;
+  dc.beginPath(); dc.arc(half, half, R * 1.1, 0, Math.PI * 2); dc.fill();
+  const ig = dc.createRadialGradient(half, half, 0, half, half, R);
+  ig.addColorStop(0,   '#ff80b0');
+  ig.addColorStop(0.5, '#ff80b0');
+  ig.addColorStop(1,   'rgba(0,0,0,0)');
+  dc.globalAlpha = 0.82;
+  dc.fillStyle   = ig;
+  dc.beginPath(); dc.arc(half, half, R, 0, Math.PI * 2); dc.fill();
+  dc.globalAlpha = 1;
+  const arm = R * 0.36, thick = R * 0.225;
+  dc.fillStyle = 'rgba(255,255,255,0.88)';
+  dc.fillRect(half - arm,       half - thick / 2, arm * 2, thick);
+  dc.fillRect(half - thick / 2, half - arm,       thick,   arm * 2);
+  _tempProtonSprite = oc;
+}
+
+// ============================================================
 //  DRAW
 // ============================================================
 function draw() {
@@ -2709,46 +2800,14 @@ function draw() {
 
   drawPhoton();
 
+  if (!_protonSprite) _buildParticleSprites();
+  const _spriteHalf = _protonSprite.width / 2;
   for (const p of particles) {
     if (p.type === 'gamma') continue;
-    const R        = PARTICLE_RADIUS;
-    const isProton = p.type === 'proton';
-    const mid      = isProton ? '#ff1a65' : '#70707f';
-    const core     = isProton ? '#ff80b0' : '#b0b0c4';
-    const jx = p.x + (p._jx || 0);
-    const jy = p.y + (p._jy || 0);
-
-    // Outer halo — soft fade
-    const baseGrad = ctx.createRadialGradient(jx, jy, 0, jx, jy, R * 1.1);
-    baseGrad.addColorStop(0,    mid);
-    baseGrad.addColorStop(0.82, mid);
-    baseGrad.addColorStop(1,    'rgba(0,0,0,0)');
-    ctx.fillStyle = baseGrad;
-    ctx.beginPath(); ctx.arc(jx, jy, R * 1.1, 0, Math.PI * 2); ctx.fill();
-
-    // Halo circle — replaces Gaussian shadow blur, same visual weight without Skia cost
-    ctx.globalAlpha = 0.15;
-    ctx.fillStyle   = core;
-    ctx.beginPath(); ctx.arc(jx, jy, R * 1.6, 0, Math.PI * 2); ctx.fill();
-
-    // Inner glow
-    const innerGlow = ctx.createRadialGradient(jx, jy, 0, jx, jy, R);
-    innerGlow.addColorStop(0,   core);
-    innerGlow.addColorStop(0.5, core);
-    innerGlow.addColorStop(1,   'rgba(0,0,0,0)');
-    ctx.globalAlpha = 0.82;
-    ctx.fillStyle   = innerGlow;
-    ctx.beginPath(); ctx.arc(jx, jy, R, 0, Math.PI * 2); ctx.fill();
-    ctx.globalAlpha = 1;
-
-    // + label on protons only
-    if (isProton) {
-      ctx.fillStyle      = 'rgba(255,255,255,0.88)';
-      ctx.font           = 'bold 11px Lexend, sans-serif';
-      ctx.textAlign      = 'center';
-      ctx.textBaseline   = 'middle';
-      ctx.fillText('+', jx, jy + 1);
-    }
+    const jx     = p.x + (p._jx || 0);
+    const jy     = p.y + (p._jy || 0);
+    const sprite = p.type === 'proton' ? _protonSprite : _neutronSprite;
+    ctx.drawImage(sprite, jx - _spriteHalf, jy - _spriteHalf);
   }
 
   ctx.restore();
@@ -4239,35 +4298,9 @@ function stepTempPhysics() {
 }
 
 function drawTempProtonAt(x, y) {
-  const R = TEMP_R;
-  // Halo circle — drawn behind particle, replaces shadowBlur
-  ctx.globalAlpha = 0.15;
-  ctx.fillStyle   = '#ff2d78';
-  ctx.beginPath(); ctx.arc(x, y, R * 1.6, 0, Math.PI * 2); ctx.fill();
-  ctx.globalAlpha = 1;
-  // Flat base circle — solid mid color, soft edge fade (v11 style)
-  const baseR = R * 1.1;
-  const baseGrad = ctx.createRadialGradient(x, y, 0, x, y, baseR);
-  baseGrad.addColorStop(0,    '#ff1a65');
-  baseGrad.addColorStop(0.82, '#ff1a65');
-  baseGrad.addColorStop(1,    'rgba(0,0,0,0)');
-  ctx.fillStyle = baseGrad;
-  ctx.beginPath(); ctx.arc(x, y, baseR, 0, Math.PI * 2); ctx.fill();
-  // Inner glow — bright centered bloom
-  const innerGlow = ctx.createRadialGradient(x, y, 0, x, y, R);
-  innerGlow.addColorStop(0,   '#ff80b0');
-  innerGlow.addColorStop(0.5, '#ff80b0');
-  innerGlow.addColorStop(1,   'rgba(0,0,0,0)');
-  ctx.globalAlpha = 0.82;
-  ctx.fillStyle = innerGlow;
-  ctx.beginPath(); ctx.arc(x, y, R, 0, Math.PI * 2); ctx.fill();
-  ctx.globalAlpha = 1;
-  // + drawn geometrically — centered, no font metric issues
-  const arm   = R * 0.36;
-  const thick = R * 0.225;
-  ctx.fillStyle = 'rgba(255,255,255,0.88)';
-  ctx.fillRect(x - arm,       y - thick / 2, arm * 2, thick);
-  ctx.fillRect(x - thick / 2, y - arm,       thick,   arm * 2);
+  if (!_tempProtonSprite) _buildTempSprite();
+  const half = _tempProtonSprite.width / 2;
+  ctx.drawImage(_tempProtonSprite, x - half, y - half);
 }
 
 function drawTemp() {
@@ -4352,7 +4385,8 @@ function detectTempFlashes() {
       }
     }
   }
-  if (tempFlashes.length > 80) tempFlashes = tempFlashes.slice(-80);
+  const flashCap = _quality === 'simple' ? 20 : 80;
+  if (tempFlashes.length > flashCap) tempFlashes = tempFlashes.slice(-flashCap);
 }
 
 function drawTempForceArrows() {
@@ -4377,9 +4411,9 @@ function drawTempForceArrows() {
     const x1 = x0 + ux * scale, y1 = y0 + uy * scale;
     ctx.save();
     ctx.strokeStyle = 'rgba(100,200,255,0.85)';
-    ctx.lineWidth = 4;
+    ctx.lineWidth = _quality === 'simple' ? 2 : 4;
     ctx.shadowColor = 'rgba(100,200,255,0.5)';
-    ctx.shadowBlur = 6;
+    ctx.shadowBlur = _quality === 'simple' ? 0 : 6;
     ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
     // Arrowhead
     const hlen = 10, hwid = 6;
