@@ -4080,7 +4080,7 @@ document.addEventListener('visibilitychange', () => {
     try {
       const state = typeof getBugState === 'function' ? getBugState() : {};
       lsSet(CRASH_KEY, JSON.stringify({ ...state, frameTimes: _ft.slice(), timestamp: new Date().toISOString() }));
-      lsSet(CLEAN_KEY, 'false');
+      if (!document.hidden) lsSet(CLEAN_KEY, 'false');
     } catch {}
   }
   setInterval(checkpoint, 1000);
