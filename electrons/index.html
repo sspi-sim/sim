@@ -2779,7 +2779,11 @@ function getShellRadius(s) {
   } else {
     pm = (s + 1) * (s + 1) * 53 / Z;
   }
-  const px = pm * shellBaseR;
+  let px = pm * shellBaseR;
+  // For K (Z=19) and heavier, spread the innermost two shells 30% farther out so the
+  // tightly-packed inner shells (e.g. Fe and above) stay visually distinguishable.
+  // Only these two shells are touched; all other radii are unchanged.
+  if (Z >= 19 && s <= 1) px *= 1.3;
   // Inner shell must clear the nucleus
   if (s === 0 && animParent) return Math.max(px, animParent.sphereR * 1.4);
   return px;
