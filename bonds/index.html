@@ -796,6 +796,22 @@
   }
   #qualitySelect:focus { outline: 1px solid rgba(255,100,100,0.4); }
   #qualitySelect:hover { color: rgba(255,255,255,0.55); border-color: rgba(255,255,255,0.18); }
+  /* `low` tier: tint the control red so the limited mode is visible at a glance */
+  #qualitySelect.q-low { color: rgba(255,120,110,0.85); border-color: rgba(255,90,80,0.45); }
+  #qualitySelect.q-low:hover { color: rgba(255,140,130,1); }
+
+  /* Transient performance message (shown when the Low tier engages). Positioned by JS
+     under the quality selector; capped width + border-box so it can't bleed past an edge. */
+  #perfMsg {
+    position: fixed; top: 60px; right: 8px; z-index: 300;
+    max-width: min(340px, calc(100vw - 16px)); box-sizing: border-box;
+    background: rgba(40,10,12,0.94); color: #ffd9d4;
+    border: 1px solid rgba(255,90,80,0.5); border-radius: 8px;
+    padding: 9px 14px; font-size: 13px; line-height: 1.35; text-align: left;
+    box-shadow: 0 4px 18px rgba(0,0,0,0.5);
+    opacity: 0; pointer-events: none; transition: opacity 0.25s ease;
+  }
+  #perfMsg.show { opacity: 1; }
 
   /* ── Dev panel ──────────────────────────────────────────────────────────── */
   .dev-row {
@@ -836,6 +852,7 @@
         <option value="hi-res">Hi-res</option>
         <option value="detailed">Detailed</option>
         <option value="simple">Simple</option>
+        <option value="low">Low</option>
       </select>
       <button class="theme-btn active" id="themeA" title="Synthwave"></button>
       <button class="theme-btn" id="themeB" title="Industrial"></button>
@@ -1093,18 +1110,40 @@ let hmImgElec  = null;
 let heatmapDirty    = true;
 
 // ── Quality selector ──────────────────────────────────────────────────────────
-let _quality = 'hi-res';  // 'hi-res' | 'simple'
-let _resetCount  = 0;
-let _benchmarkMs = 0;
+let _quality = 'hi-res';  // 'hi-res' | 'detailed' | 'simple' | 'low'
 
 // ── Dev perf toggles (driven by _applyQuality) ────────────────────────────────
 let _flatFill = true;
 
+// `simple` and `low` share one flat-fill / 30fps cheap path. `low` is `simple` pushed
+// further (1 trail bucket + shortened trails) for devices that would otherwise crash.
+function _isLowTier(q = _quality) { return q === 'simple' || q === 'low'; }
+
+let _perfMsgTimer = null;
+function _showPerfMsg(text) {
+  let el = document.getElementById('perfMsg');
+  if (!el) { el = document.createElement('div'); el.id = 'perfMsg'; document.body.appendChild(el); }
+  el.textContent = text;
+  // Anchor directly under the quality selector; right/max-width clamped so it never bleeds offscreen.
+  const q = document.getElementById('qualitySelect');
+  if (q) {
+    const r = q.getBoundingClientRect();
+    el.style.top = (r.bottom + 6) + 'px';
+    el.style.right = Math.max(8, window.innerWidth - r.right) + 'px';
+  }
+  void el.offsetWidth;  // replay the transition even if already shown
+  el.classList.add('show');
+  clearTimeout(_perfMsgTimer);
+  _perfMsgTimer = setTimeout(() => el.classList.remove('show'), 6000);
+}
+
 function _applyQuality(level) {
+  const wasLow = _quality === 'low';
   _quality = level;
   const el = document.getElementById('qualitySelect');
-  if (el) el.value = level;
+  if (el) { el.value = level; el.classList.toggle('q-low', level === 'low'); }
   _flatFill = true;
+  if (level === 'low' && !wasLow) _showPerfMsg('Model features are limited. Close tabs or restart your browser for better performance.');
 }
 
 // Draws 100 gradient+shadowBlur particles to an offscreen canvas and returns ms.
@@ -1340,7 +1379,7 @@ function drawElectricHeatmap(particleList, sampleFrac = 0.5, sigmaScale = 1.0, m
     destCtx.drawImage(hmComposite, 0, 0);
     return;
   }
-  const scale    = _quality === 'simple' ? 0.08 : _quality === 'detailed' ? 0.15 : 0.25;
+  const scale    = _isLowTier() ? 0.08 : _quality === 'detailed' ? 0.15 : 0.25;
   const w        = Math.ceil(fullW * scale);
   const h        = Math.ceil(fullH * scale);
   const invScale = 1 / scale;
@@ -1556,7 +1595,7 @@ function drawParticles(particles, jitterScale = 1, radiusScale = 1, drawCtx = ct
     const core = isProton ? '#ff80b0' : '#b0b0c4';
 
     if (_flatFill) {
-      if (_quality !== 'simple') {
+      if (!_isLowTier()) {
         // Hi-res / Detailed: layered rings matching v11 particle appearance
         // Draw back-to-front using filled circles so rings never bleed inside
         const cW = 4;   // colored mid-ring width (world px — scales with zoom)
@@ -2048,6 +2087,7 @@ let orb3dAZ = 0.60;       // azimuth angle (horizontal rotation)
 let orb3dEL = 0.42;       // elevation angle (vertical tilt)
 let orb3dPaused = false;  // true = electrons frozen; drag rotates view
 let orb3dDragState = null; // { lastX, lastY, moved } during active drag
+let _LOW_TRAIL_CAP = 60;   // `low` tier only: render only the last N trail points per electron (console-tunable)
 
 // Per-shell group state — each shell has independent pair/loner groups
 let orb3dShellCounts = new Array(ORB3D_N).fill(0);  // total electrons per shell (for display)
@@ -2130,7 +2170,8 @@ function _drawOrbit3DCore(ctx, cx, cy, elecs, shellGroups, Z, forceAllGray = fal
   const occupied = [...new Set(elecs.map(e => e.shell))].sort((a,b)=>a-b);
   // forceAllGray: cation (e.g. Na+) has no valence electrons — all shells rendered as inner (gray)
   const _outerS3D = forceAllGray ? Infinity : (occupied.length ? occupied[occupied.length - 1] : 0);
-  const _nB = _quality === 'hi-res' ? 32 : _quality === 'detailed' ? 4 : 2;
+  const _nB = _quality === 'hi-res' ? 32 : _quality === 'detailed' ? 4 : _quality === 'simple' ? 2 : 1;
+  const _low = _quality === 'low';  // render only the last _LOW_TRAIL_CAP points — shorter comet, far less work
   const _trailMaxAlpha = LIGHT ? 0.92 : 0.75;
   ctx.lineWidth = 1.5;
   ctx.lineCap = 'round';
@@ -2149,8 +2190,9 @@ function _drawOrbit3DCore(ctx, cx, cy, elecs, shellGroups, Z, forceAllGray = fal
       for (let ei = 0; ei < grp.count; ei++) {
         const trail = grp.trails[ei], n = trail.length;
         if (n < 2) { bucket.push(null); continue; }
+        const _start = _low ? Math.max(0, n - _LOW_TRAIL_CAP) : 0;
         const pts = [];
-        for (let i = 0; i < n; i++) pts.push(proj3D(trail[i][0], trail[i][1], trail[i][2], r3d));
+        for (let i = _start; i < n; i++) pts.push(proj3D(trail[i][0], trail[i][1], trail[i][2], r3d));
         bucket.push(pts);
       }
     }
@@ -2227,7 +2269,7 @@ function drawOrbit3D(ctx) {
     if (showParticles) {
       const _svFlat = _flatFill, _svQ = _quality;
       if (_quality === 'hi-res') _flatFill = false;
-      else if (_quality === 'simple') _quality = 'detailed';
+      else if (_isLowTier()) _quality = 'detailed';
       drawParticles(animParent.particles,1);
       _flatFill = _svFlat; _quality = _svQ;
     } else drawCloudOutline(animParent.cx,animParent.cy,animParent.sphereR);
@@ -2240,7 +2282,7 @@ function drawOrbit3D(ctx) {
     if (showParticles) {
       const _svFlat = _flatFill, _svQ = _quality;
       if (_quality === 'hi-res') _flatFill = false;
-      else if (_quality === 'simple') _quality = 'detailed';
+      else if (_isLowTier()) _quality = 'detailed';
       drawParticles(animParentB.particles,1);
       _flatFill = _svFlat; _quality = _svQ;
     } else drawCloudOutline(animParentB.cx,animParentB.cy,animParentB.sphereR);
@@ -2261,7 +2303,7 @@ function drawOrbit3D(ctx) {
       const x=nx*r3d, y=ny*r3d, z=nz*r3d, rx=x*cosAZ+z*sinAZ, ry=y, rz=-x*sinAZ+z*cosAZ;
       return [cxB+rx, centerY-(ry*cosEL-rz*sinEL)];
     }
-    const _nB = _quality === 'hi-res' ? 32 : _quality === 'detailed' ? 4 : 2;
+    const _nB = _quality === 'hi-res' ? 32 : _quality === 'detailed' ? 4 : _quality === 'simple' ? 2 : 1;
     const _trailMaxAlpha = LIGHT ? 0.92 : 0.75;
     const colorPts  = new Map();  // color → pts[][]
     const arrowData = new Map();  // color → [{tx,ty,px2,py2,_aw,_al}]
@@ -2282,13 +2324,15 @@ function drawOrbit3D(ctx) {
           for (let ei = 0; ei < grp.count; ei++) {
             const trail = grp.trails[ei], n = trail.length;
             if (n < 2) { bucket.push(null); continue; }
+            const _start = (_quality === 'low') ? Math.max(0, n - _LOW_TRAIL_CAP) : 0;  // low: shorter trails
             const pts = [];
-            for (let i = 0; i < n; i++) pts.push(proj(trail[i][0], trail[i][1], trail[i][2], r3d));
+            for (let i = _start; i < n; i++) pts.push(proj(trail[i][0], trail[i][1], trail[i][2], r3d));
             bucket.push(pts);
             if (orb3dDotR > 0 && !_shellOffScreen) {
               if (!arrowData.has(grpCol)) arrowData.set(grpCol, []);
-              const [tx, ty] = pts[n - 1];
-              const [px2, py2] = pts[Math.max(0, n - 3)];
+              const m = pts.length;
+              const [tx, ty] = pts[m - 1];
+              const [px2, py2] = pts[Math.max(0, m - 3)];
               const _as = s === occupied[0] ? 1.3 : 1.0;
               const _aw = Math.min(orb3dDotR * r3d / 200 * 0.65 * _as, 7.5), _al = _aw / 0.65;
               arrowData.get(grpCol).push({ tx, ty, px2, py2, _aw, _al });
@@ -3543,7 +3587,7 @@ function stepElectrons() {
       }
     }
     e.trail.push({ x: e.x, y: e.y });
-    const _tMax = (_quality === 'simple' && e.shell < _maxShell) ? Math.round(eTrailLen * 0.6) : eTrailLen;
+    const _tMax = (_isLowTier() && e.shell < _maxShell) ? Math.round(eTrailLen * 0.6) : eTrailLen;
     if (e.trail.length > _tMax) e.trail.shift();
   }
 }
@@ -4249,7 +4293,7 @@ function draw() {
   ctx.fillStyle = LIGHT ? getBgColor() : '#05040f';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   if (currentMode === 'molecules') { drawMolecule(ctx); return; }
-  if (currentTab === 'orbit3d') { drawOrbit3D(ctx); return; }
+  if (currentTab === 'orbit3d') { const _t0 = performance.now(); drawOrbit3D(ctx); _recordOrbitDrawCost(performance.now() - _t0); return; }
   if (!animParent) { drawEnergyGraph(); return; }
 
   ctx.save();
@@ -4556,6 +4600,10 @@ document.getElementById('autoscaleCheckbox').addEventListener('change', function
 
 document.getElementById('qualitySelect').addEventListener('change', function() {
   _applyQuality(this.value);
+  // A manual pick is authoritative: it becomes the auto ceiling and clears any oscillation lock.
+  _qualityCeiling = this.value;
+  _tierEnteredVia = 'manual'; _tierEnteredAt = performance.now();
+  _lastAdaptAt = performance.now(); _drawCosts.length = 0;
   draw();
 });
 
@@ -4973,7 +5021,7 @@ function _molScreenPos(site, centerX, centerY, molZoom) {
 
 function drawMolecule(ctx) {
   if (!molSites.length) { initMolecule(); return; }
-  if (currentTab === 'orbit3d') { drawMolTrails(ctx); return; }
+  if (currentTab === 'orbit3d') { const _t0 = performance.now(); drawMolTrails(ctx); _recordOrbitDrawCost(performance.now() - _t0); return; }
   const W = canvas.width, H = canvas.height;
   const tbH = document.getElementById('toolbar').offsetHeight;
   const centerX = W / 2 + panOffsetX;
@@ -5170,9 +5218,10 @@ function drawMolTrails(ctx) {
   // to screen using the actual bond direction so angled bonds (H2O) work correctly.
   if (molBondElecs.length) {
     const LIGHT = document.body.classList.contains('screenshot-mode');
-    const _nB = _quality === 'hi-res' ? 32 : _quality === 'detailed' ? 4 : 2;
+    const _nB = _quality === 'hi-res' ? 32 : _quality === 'detailed' ? 4 : _quality === 'simple' ? 2 : 1;
     const _trailMaxAlpha = LIGHT ? 0.92 : 0.75;
     const colorPts = new Map();
+    const arrowData = new Map();   // head arrowheads for bond electrons (e.g. H in H2O, C in CO2)
     for (const bond of molBondElecs) {
       const siteA = molSites[bond.siteAIdx], siteB = molSites[bond.siteBIdx];
       const sxA = centerX + siteA.cx_rel * molZoom, syA = centerY + siteA.cy_rel * molZoom;
@@ -5183,7 +5232,12 @@ function drawMolTrails(ctx) {
         const col = LIGHT ? _darkenHex(e.color) : e.color;
         if (!colorPts.has(col)) colorPts.set(col, []);
         // Project bond-local (frac, perp) → screen: along-bond is (dx,dy), perp is (-dy,dx)
-        colorPts.get(col).push(e.fracs.map(f => [sxA + f.frac * dx - f.perp * dy, syA + f.frac * dy + f.perp * dx]));
+        const pts = e.fracs.map(f => [sxA + f.frac * dx - f.perp * dy, syA + f.frac * dy + f.perp * dx]);
+        colorPts.get(col).push(pts);
+        if (!arrowData.has(col)) arrowData.set(col, []);
+        const n = pts.length;
+        arrowData.get(col).push({ tx: pts[n-1][0], ty: pts[n-1][1],
+                                  px2: pts[Math.max(0,n-2)][0], py2: pts[Math.max(0,n-2)][1] });
       }
     }
     ctx.lineWidth = 1.5; ctx.lineCap = 'round';
@@ -5209,6 +5263,24 @@ function drawMolTrails(ctx) {
         ctx.stroke();
       }
     }
+    // Arrowheads at each bond electron's head — same triangle as the single-atom bond trails.
+    ctx.globalAlpha = 1;
+    for (const [col, arrows] of arrowData) {
+      ctx.fillStyle = col;
+      ctx.beginPath();
+      for (const { tx, ty, px2, py2 } of arrows) {
+        let adx = tx - px2, ady = ty - py2;
+        const dl = Math.sqrt(adx*adx + ady*ady);
+        if (dl > 0.5) { adx /= dl; ady /= dl; } else { adx = 1; ady = 0; }
+        const _aw = 5, _al = 11, perpx = -ady, perpy = adx;
+        ctx.moveTo(tx + adx*_al,             ty + ady*_al);
+        ctx.lineTo(tx - adx*_al + perpx*_aw, ty - ady*_al + perpy*_aw);
+        ctx.lineTo(tx - adx*_al * 0.25,      ty - ady*_al * 0.25);
+        ctx.lineTo(tx - adx*_al - perpx*_aw, ty - ady*_al - perpy*_aw);
+        ctx.closePath();
+      }
+      ctx.fill();
+    }
     ctx.globalAlpha = 1;
   }
 
@@ -5217,16 +5289,117 @@ function drawMolTrails(ctx) {
 
 // ─── End molecule mode ────────────────────────────────────────────────────────
 
+// Orbit frame cadence. 33ms ≈ 30fps; paused heartbeats redraw a frozen view rarely.
+const FRAME_MS_30 = 33;
+const FRAME_MS_PAUSED = 200;     // ~5fps: paused, not-dragged weak-tier orbit (nothing moving)
+const FRAME_MS_PAUSED_LOW = 400; // ~2.5fps on `low` — even less reason to redraw
+
+// ── Runtime adaptive quality ──────────────────────────────────────────────────
+// The startup benchmark scores the machine once, but real capacity drifts mid-session
+// (thermal throttling, battery saver, background tabs, a heavier molecule loaded). This
+// times the ACTUAL orbit draw (not the RAF interval — that's polluted by our own throttles)
+// and steps the tier down when it can't keep up, back up when it recovers. Median smoothing,
+// a cooldown, a ceiling (never auto-exceed startup/user pick), steep headroom to upgrade, and
+// an anti-oscillation lockout keep it from flapping.
+const _QTIERS = ['low', 'simple', 'detailed', 'hi-res'];
+let _qualityCeiling = 'hi-res';
+let _autoQuality = true;
+const _drawCosts = [];
+const _DRAW_COST_WINDOW = 40, _ADAPT_COOLDOWN_MS = 2500, _ADAPT_MIN_SAMPLES = 20, _DOWN_FACTOR = 0.9, _OSC_WINDOW_MS = 12000;
+let _lastAdaptAt = 0, _tierEnteredVia = 'init', _tierEnteredAt = 0, _lastAdaptMedian = 0;
+function _budgetMs()  { return _quality === 'hi-res' ? 16.7 : 33.3; }
+function _median(arr) { const a = arr.slice().sort((x,y)=>x-y), m = a.length >> 1; return a.length % 2 ? a[m] : (a[m-1]+a[m])/2; }
+function _setAutoQuality(level, via, now) {
+  _applyQuality(level);
+  _tierEnteredVia = via; _tierEnteredAt = now; _lastAdaptAt = now; _drawCosts.length = 0;
+  if (window._perfLog) console.log(`[adapt] ${via} → ${level}  (median ${_lastAdaptMedian.toFixed(1)}ms, budget ${_budgetMs().toFixed(1)}ms)`);
+  draw();
+}
+function _recordOrbitDrawCost(ms) {
+  if (orb3dDragState) return;
+  _drawCosts.push(ms);
+  if (_drawCosts.length > _DRAW_COST_WINDOW) _drawCosts.shift();
+  if (!_autoQuality) return;
+  const now = performance.now();
+  if (now - _lastAdaptAt < _ADAPT_COOLDOWN_MS || _drawCosts.length < _ADAPT_MIN_SAMPLES) return;
+  const med = _lastAdaptMedian = _median(_drawCosts), budget = _budgetMs();
+  const cur = _QTIERS.indexOf(_quality), ceil = _QTIERS.indexOf(_qualityCeiling);
+  if (med > budget * _DOWN_FACTOR && cur > 0) {
+    if (_tierEnteredVia === 'up' && now - _tierEnteredAt < _OSC_WINDOW_MS) _qualityCeiling = _QTIERS[cur - 1];
+    _setAutoQuality(_QTIERS[cur - 1], 'down', now);
+  } else if (cur < ceil) {
+    const upFactor = _QTIERS[cur + 1] === 'hi-res' ? 0.15 : 0.40;
+    if (med < budget * upFactor) _setAutoQuality(_QTIERS[cur + 1], 'up', now);
+  }
+}
+window.setAutoQuality = function(on) { _autoQuality = !!on; if (!on) _drawCosts.length = 0; return _autoQuality; };
+window.perfReport = function() {
+  const med = _drawCosts.length ? _median(_drawCosts) : NaN;
+  console.table({ quality: _quality, ceiling: _qualityCeiling, autoQuality: _autoQuality,
+    'median draw': isNaN(med) ? '—' : med.toFixed(1)+'ms', 'frame budget': _budgetMs().toFixed(1)+'ms',
+    samples: _drawCosts.length, enteredVia: _tierEnteredVia, lowTrailCap: _LOW_TRAIL_CAP });
+  return med;
+};
+
+// Calibration: measure a bonded pair's orbit-draw cost at hi-res. Console: benchPair(82,17).
+// Forces hi-res + auto off so the number is the uncapped worst case, then restores both.
+window.benchPair = async function(zA, zB, secs = 3) {
+  const _savedTab = currentTab, _savedQ = _quality, _savedAuto = _autoQuality;
+  const sel = document.getElementById('bondComboSelect');
+  if (sel) { sel.value = zA + ',' + zB; sel.dispatchEvent(new Event('change')); }
+  const tabBtn = document.querySelector('.awheel-item[data-tab="orbit3d"]');
+  if (tabBtn) tabBtn.click(); else { currentTab = 'orbit3d'; if (typeof syncTabButtons === 'function') syncTabButtons(); }
+  window.setAutoQuality(false);
+  _applyQuality('hi-res');
+  await new Promise(r => setTimeout(r, 800));   // settle: trails fill, JIT/GPU warm
+  _drawCosts.length = 0;
+  const frames = []; let last = 0, t0 = performance.now();
+  await new Promise(resolve => {
+    (function tick(now) {
+      if (last) frames.push(now - last); last = now;
+      if (now - t0 < secs * 1000) requestAnimationFrame(tick); else resolve();
+    })(performance.now());
+  });
+  const s = _drawCosts.slice().sort((a, b) => a - b);
+  const med = s.length ? s[s.length >> 1] : NaN;
+  const p90 = s.length ? s[Math.min(s.length - 1, Math.floor(s.length * 0.9))] : NaN;
+  const fs = frames.slice().sort((a, b) => a - b);
+  const fmed = fs.length ? fs[fs.length >> 1] : NaN;
+  const fps = fmed ? 1000 / fmed : NaN;
+  _applyQuality(_savedQ); window.setAutoQuality(_savedAuto);
+  if (_savedTab !== 'orbit3d') { const b = document.querySelector(`.awheel-item[data-tab="${_savedTab}"]`); if (b) b.click(); }
+  const r = { pair: zA + '–' + zB, drawMedianMs: +med.toFixed(2), drawP90Ms: +p90.toFixed(2),
+              frameMs: +fmed.toFixed(1), fps: +fps.toFixed(0), cpuPctOf60: +(med / 16.67 * 100).toFixed(0), samples: s.length };
+  console.log(`[benchPair] ${r.pair}: draw med ${r.drawMedianMs}ms (p90 ${r.drawP90Ms}) | ${r.fps}fps | ~${r.cpuPctOf60}% of a 60fps CPU budget`);
+  return r;
+};
+window.benchPairs = async function(list, secs = 3) {
+  const out = []; for (const [a, b] of list) out.push(await window.benchPair(a, b, secs));
+  console.table(out); console.log('[benchPairs] DONE'); return out;
+};
+// URL hook so the sweep can be driven headlessly: localhost:8100/?bench=82,17;50,17;11,17;6,1
+(function () {
+  const q = new URLSearchParams(location.search).get('bench');
+  if (q) { const list = q.split(';').map(p => p.split(',').map(Number)); setTimeout(() => window.benchPairs(list, 3), 1500); }
+})();
+
 function idleParticleLoop(now) {
   const _isOrbit = currentTab === 'orbit3d';
-  const _orb3dReady = _quality === 'hi-res' || now - _orb3dLast >= 33;
+  const _hiRes = _quality === 'hi-res';
+  // Paused, not-dragged weak-tier orbit = nothing moving: drop to a slow heartbeat.
+  const _orbStatic = _isOrbit && orb3dPaused && !orb3dDragState && !_hiRes;
+  const _orbInterval = _orbStatic ? (_quality === 'low' ? FRAME_MS_PAUSED_LOW : FRAME_MS_PAUSED)
+                     : (_hiRes ? 0 : FRAME_MS_30);
+  const _orb3dReady = !_isOrbit || now - _orb3dLast >= _orbInterval;
 
-  if (animParent && showParticles) updateParticleJitter(animParent.particles.length, 1, true);
+  // Nucleus jitter: hi-res only in orbit (invisible at that scale); skip on the low tier.
+  if (animParent && showParticles && (_isOrbit ? _hiRes : !_isLowTier()))
+    updateParticleJitter(animParent.particles.length, 1, true);
+
   if (currentMode === 'molecules') {
     if (_isOrbit) {
       if (!orb3dPaused && _orb3dReady) {
         const _dt = Math.min((_orb3dLast > 0 ? now - _orb3dLast : 16.67) / 16.67, 2.5);
-        _orb3dLast = now;
         stepMolOrbit3D(_dt);
       }
       if (!orb3dPaused) stepMolBondElecs();
@@ -5235,7 +5408,6 @@ function idleParticleLoop(now) {
     if (_isOrbit) {
       if (!orb3dPaused && _orb3dReady) {
         const _dt = Math.min((_orb3dLast > 0 ? now - _orb3dLast : 16.67) / 16.67, 2.5);
-        _orb3dLast = now;
         stepOrbit3D(_dt);
         stepOrbit3DB(_dt);
       }
@@ -5250,7 +5422,10 @@ function idleParticleLoop(now) {
     _stepBondElecSecond();
     _stepBondDots();
   }
-  if ((!_isOrbit || _orb3dReady) && (animParent || _isOrbit || currentMode === 'molecules')) draw();
+  if (_orb3dReady && (animParent || _isOrbit || currentMode === 'molecules')) {
+    if (_isOrbit) _orb3dLast = now;
+    draw();
+  }
   idleParticleRAF = requestAnimationFrame(idleParticleLoop);
 }
 
@@ -6071,25 +6246,26 @@ initNuclei();
 // Startup benchmark — measure gradient render cost, set initial quality.
 // Benchmark returns minimum of two 100-particle timed passes (cold-start eliminated).
 // Gradient rendering only fires in hi-res mode; detailed/simple use flat fill.
-//   < 8ms  → hi-res    (modern + mid-range hardware; occasional frame drops OK)
-//   8–13ms → detailed  (older hardware; flat-fill 60fps viable)
-//   > 13ms → simple    (budget Chromebooks + under load; needs 30fps gate)
-// Hi-res/detailed defaults: all 3 options shown.
-// Simple default: hi-res option removed.
+//   < 8ms   → hi-res   (modern + mid-range hardware; occasional frame drops OK)
+//   8–13ms  → detailed (older hardware; flat-fill 60fps viable)
+//   13–40ms → simple   (budget Chromebooks + under load; needs 30fps gate)
+//   > 40ms  → low      (would otherwise crash: 1 trail bucket, short trails, no jitter)
+// Hi-res/detailed defaults: all options shown. Simple/low defaults: hi-res option removed.
 (function _startupBenchmark() {
   const ms = _runPerfBenchmark();
-  _benchmarkMs = ms;
   const msT = _runTrailBenchmark();
   const el = document.getElementById('benchScore');
   if (el) el.textContent = `grad ${ms.toFixed(1)}ms  trail ${msT.toFixed(1)}ms`;
   if (msT > 13) {
     const hiOpt = document.querySelector('#qualitySelect option[value="hi-res"]');
     if (hiOpt) hiOpt.remove();
-    _applyQuality('simple');
+    _applyQuality(msT > 40 ? 'low' : 'simple');
   } else if (msT > 8) {
     _applyQuality('detailed');
   }
-  // else stays 'hi-res' (default); all three options remain available
+  // else stays 'hi-res' (default); all options remain available
+  // Pin the auto ceiling to the benchmark's choice — adaptive may drop below it, never above.
+  _qualityCeiling = _quality;
 }());
 
 _reapplyCurrentBond();
@@ -6101,82 +6277,13 @@ syncForceVizVisibility();
 draw();
 if (!idleParticleRAF) idleParticleLoop();
 
-// ── Crash tracking ─────────────────────────────────────────────────────────
-(function() {
-  const CRASH_KEY  = 'sim_crash_checkpoint';
-  const CLEAN_KEY  = 'sim_clean_exit';
-  const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbx876hooVliEwFIO0wNO3qZ5FyN0UVUgt1iexEVl8O0vQhem6qPU7WG1LqPpqvf8BU/exec';
-  const MAX_FTIMES = 90;
-
-  function lsGet(k)    { try { return localStorage.getItem(k); }    catch { return null; } }
-  function lsSet(k, v) { try { localStorage.setItem(k, v); }        catch {} }
-  function lsDel(k)    { try { localStorage.removeItem(k); }        catch {} }
-
-  const _ft = [];
-  let _lastT = 0;
-  const _origRAF = window.requestAnimationFrame.bind(window);
-  window.requestAnimationFrame = function(cb) {
-    return _origRAF(function(t) {
-      const d = t - _lastT;
-      if (_lastT > 0 && d > 4) { _ft.push(+d.toFixed(1)); if (_ft.length > MAX_FTIMES) _ft.shift(); }
-      _lastT = t;
-      cb(t);
-    });
-  };
-
-  function checkpoint() {
-    try {
-      const state = typeof getBugState === 'function' ? getBugState() : {};
-      lsSet(CRASH_KEY, JSON.stringify({ ...state, frameTimes: _ft.slice(), timestamp: new Date().toISOString() }));
-      if (!document.hidden) lsSet(CLEAN_KEY, 'false');
-    } catch {}
-  }
-  setInterval(checkpoint, 1000);
-
-  function submitCrash(raw) {
-    try {
-      const cp = JSON.parse(raw);
-      const simId = (cp.sim || 'unknown') + (cp.version ? '-FTv' + cp.version : '');
-      const stateStr = JSON.stringify(cp);
-      const params = new URLSearchParams({
-        action:     'appendNote',
-        id:         Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
-        studentId:  'AUTO_CRASH',
-        timestamp:  cp.timestamp || new Date().toISOString(),
-        simVersion: simId,
-        simState:   stateStr.length > 3800 ? stateStr.slice(0, 3800) + '…' : stateStr,
-        text:       'AUTO_CRASH: ' + simId + ' at ' + (cp.timestamp || '(unknown)'),
-        isPublic:   false,
-      });
-      fetch(SCRIPT_URL + '?' + params).catch(() => {});
-    } catch {}
-  }
-
-  const prev      = lsGet(CRASH_KEY);
-  const prevClean = lsGet(CLEAN_KEY);
-  lsDel(CRASH_KEY);
-  lsDel(CLEAN_KEY);
-  if (prev && prevClean === 'false') submitCrash(prev);
-
-  function markClean() { lsSet(CLEAN_KEY, 'true'); }
-  document.addEventListener('visibilitychange', () => { if (document.hidden) markClean(); });
-  window.addEventListener('beforeunload', markClean);
-})();
-
 // ── Bug report button ─────────────────────────────────────────────────────
 function getBugState() {
   return {
     sim:          'atom-builder',
-    version:      '1.10',
     nucleus:      selectedNucleusKey,
     viewZoom:     +viewZoom.toFixed(3),
     actionLog:    actionLog.slice(),
-    resetCount:   _resetCount,
-    quality:      _quality,
-    benchmarkMs:  _benchmarkMs,
-    activeLoops:  { idleJitter: !!idleParticleRAF, loop: false, tempLoop: false, iconAnim: false, replay: false },
-    heapMB:       Math.round((performance.memory?.usedJSHeapSize || 0) / 1048576),
-    canvasSize:   canvas.width + 'x' + canvas.height,
   };
 }
 document.getElementById('bugReportBtn').addEventListener('click', e => {
