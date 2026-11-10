@@ -1,0 +1,1267 @@
+import { useMemo, useRef, useEffect } from 'react'
+import { initPhysics, stepPhysics, setSiOr0,
+         computeKE, computeBondedKE, computePE, ENERGY_UNIT, THERMAL_SPEED,
+         buildRigidBondMap, setSioExclMult, setBreakStrain, setReformStrain, setCrystAnchorK, setLiberateFrac, setSioK, setNaOK,
+         setNaAnchorK, setNaLiberateFrac, setNaBreakStrain, setLatticeSpeedMult, setFreedSpeedMult,
+         resetLibStats, getLibStats, measureStrain95, meltStructure, setUseEmaStrain,
+         verifyHashPairs, setMeltHash, setCoolBondScale } from './meltPhysics.js'
+import { drawScene, QTY_COLORS, ENERGY_KJ_MULT, setVisualScale, findAtomNear, getVisualScale, getLastHudLines, effectiveDpr } from './renderer.js'
+import { buildGrid, buildAllAtoms } from './meltGrid.js'
+import { T as GT } from './glassTemps.js'
+import { heatCap, energyContent, coolEnergyContent, coolTempForContent, rampEnergyLinearInContent, FAST_COOL_FRAMES, SLOW_COOL_FRAMES, coolFrames, BASE_STEPS_PER_SEC } from './meltRamp.js'
+import { snapshotFull, restoreFull } from './meltTrack.js'   // Particles catch-up (states computed by meltTrackWorker)
+
+
+// Cooling durations in SIM STEPS (not frames). With wall-clock pacing the ramp advances by
+// the number of steps taken, so a cool always runs this many relaxation steps regardless of
+// frame rate — the slow-vs-fast-cool structure difference no longer depends on the hardware.
+// At BASE_STEPS_PER_SEC these equal the historical ~4.5 s / ~24 s wall-clock at simSpeed 1.
+const REPLAY_MAX = 900          // history frames kept (decimated beyond this)
+const END_HOLD_S = 3            // history keeps recording this long (s of running time) after reaching 0 / 1800 °C
+
+// Wall-clock pacing: the sim advances by elapsed real time, not per rendered frame, so faster
+// hardware just draws more (smoother) frames of the SAME sim rate instead of running faster.
+const MAX_FRAME_DT       = 0.1  // clamp elapsed (s): a struggling machine lags, never spirals
+const MAX_STEPS_PER_FRAME = 8   // safety cap on catch-up work in any single frame
+
+
+const C = {
+  Si: '#d4a020', O: '#cc3a3a', Ca: '#4a96be', Na: '#4aaa60',
+  bg_sio2:  '#d8cb98', bg_cao:  '#ede8df', bg_na2o:  '#ddeedd',
+  bdr_sio2: '#a09050', bdr_cao: '#b0a898', bdr_na2o: '#88aa88',
+  lbl_sio2: '#7a6830', lbl_cao: '#5a7080', lbl_na2o: '#4a7850',
+}
+
+
+// ── Graph drawing helpers ─────────────────────────────────────────────────────
+function setupCanvas(canvas) {
+  if (!canvas || !canvas.clientWidth) return null
+  const dpr = effectiveDpr()
+  const w = canvas.clientWidth, h = canvas.clientHeight
+  const cw = Math.round(w * dpr), ch = Math.round(h * dpr)
+  if (canvas.width !== cw || canvas.height !== ch) { canvas.width = cw; canvas.height = ch }
+  const ctx = canvas.getContext('2d')
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+  return { ctx, w, h }
+}
+
+function fmtE(v) {
+  return v >= 1000 ? `${(v / 1000).toFixed(v % 1000 === 0 ? 0 : 1)}k` : String(v)
+}
+
+// x-axis = thermal energy CONTENT at temperature T: ∫₀ᵀ hc(T)·dT, in per-particle units.
+// Mirrors meltHeatCapacity in GlassViewer (ramp 500→750 to a Na₂O-scaled plateau).
+const GRAPH_E_MIN = 0
+// Graph geometry (CSS px) — shared by drawing and by pointer hit-testing.
+export const GRAPH_PAD = { L: 46, R: 10, T: 10, B: 30 }   // also positions GlassViewer's axis dropdown
+const GRAPH_MAX_MARKERS = 3
+export const GRAPH_TIME_COL = { dark: '#d8d8d8', light: '#333' }   // time-axis label colour
+// Time axis: fixed 60 s minimum, so every heating run (pure fast ≈ 9 s … Na₂O slow ≈ 53 s) shares
+// one scale and fast vs slow slopes compare directly; steps up only when a trip runs longer.
+const GRAPH_T_STEPS = [60, 90, 120, 180, 240, 300, 450, 600, 900, 1200, 1800, 2400, 3600]
+const graphTimeMax = s => GRAPH_T_STEPS.find(v => v >= s) ?? Math.ceil(s / 600) * 600
+// ui (optional, GlassViewer's graphUiRef.current): { mouse: {x,y}|null, clicks: [{x,y}], markers: [{t}],
+//   xMode: 'time' (default) | 'energy' }. xMode is set by GlassViewer's axis dropdown (an HTML overlay
+//   on the x-label spot — this draws everything but that label).
+// hist points: { e: graph energy, t: °C, s: trip time (s) }.
+// x = time: the trip unfolds left → right (heat up, then cool down); at constant heating power
+//   the slope is the heating rate ÷ heat capacity, so latent heat shows as a slower climb / shelf.
+// x = energy: the hysteresis loop (cooling runs back along the energy axis).
+// Markers ANNOTATE the curve — they can only be placed on it, never on bare axis:
+//  · hover within 14 px of the curve → coordinate readout (kJ · °C) at the nearest point
+//  · click the curve → fixed dotted horizontal line at that point's temperature (≤3);
+//    click a line → remove it
+//  · each line labels its °C at the right end and dots every place the curve crosses it
+function drawTEGraph(canvas, hist, darkMode = true, eMax = 4e-3, targetTempLine = null, ui = null, replayPt = null) {
+  const s = setupCanvas(canvas)
+  if (!s) return
+  const { ctx, w, h } = s
+  const pL = GRAPH_PAD.L, pR = GRAPH_PAD.R, pT = GRAPH_PAD.T, pB = GRAPH_PAD.B
+  const pw = w - pL - pR, ph = h - pT - pB
+
+  const tMax = 1800
+  const n = hist.length
+  const timeMode = !ui || ui.xMode !== 'energy'
+  const sMax = graphTimeMax(n ? hist[n - 1].s ?? 0 : 0)
+  const kJ  = e => Math.round(e / ENERGY_UNIT * ENERGY_KJ_MULT)   // same scale as the toolbar kJ LCD
+  const xOf = p => timeMode ? (p.s ?? 0) : p.e                     // a point's x value in this mode
+  const toX = v => timeMode ? pL + Math.max(0, Math.min(1, v / sMax)) * pw
+                            : pL + Math.max(0, Math.min(1, (v - GRAPH_E_MIN) / (eMax - GRAPH_E_MIN))) * pw
+  const toY = t => pT + ph - (Math.max(0, t) / tMax) * ph
+
+  ctx.clearRect(0, 0, w, h)
+  ctx.fillStyle = darkMode ? 'rgba(8,6,4,0.82)' : 'rgba(224,219,210,0.95)'   // off-white, matches viz-panel
+  ctx.fillRect(0, 0, w, h)
+
+  // Axes — colour-coded to match the ENERGY / TEMP labels above the toolbar LCDs (QTY_COLORS):
+  // y (temperature) warm, x (energy) blue.
+  const eCol = darkMode ? QTY_COLORS.energy.dark : QTY_COLORS.energy.light
+  const tCol = darkMode ? QTY_COLORS.temp.dark   : QTY_COLORS.temp.light
+  ctx.lineWidth = 1
+  ctx.strokeStyle = tCol; ctx.beginPath(); ctx.moveTo(pL, pT); ctx.lineTo(pL, pT + ph); ctx.stroke()
+  ctx.strokeStyle = eCol; ctx.beginPath(); ctx.moveTo(pL, pT + ph); ctx.lineTo(pL + pw, pT + ph); ctx.stroke()
+
+  // Axis labels (2× size, high contrast)
+  ctx.fillStyle = tCol; ctx.font = "bold 14px Lexend, system-ui, sans-serif"; ctx.textAlign = 'right'; ctx.textBaseline = 'middle'
+  ctx.fillText(String(tMax), pL - 4, pT + 2)
+  ctx.fillText('0', pL - 4, pT + ph)
+  // x label itself = GlassViewer's axis dropdown (HTML, over this spot); only the axis max is drawn
+  const xCol = timeMode ? GRAPH_TIME_COL[darkMode ? 'dark' : 'light'] : eCol
+  ctx.fillStyle = xCol; ctx.textBaseline = 'bottom'
+  ctx.font = "bold 11px Lexend, system-ui, sans-serif"; ctx.textAlign = 'right'
+  ctx.fillText(String(timeMode ? sMax : kJ(eMax)), pL + pw, h - 4)
+  ctx.fillStyle = tCol; ctx.font = "bold 14px Lexend, system-ui, sans-serif"
+  ctx.save(); ctx.translate(14, pT + ph / 2); ctx.rotate(-Math.PI / 2)
+  ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic'   // centred on the y axis (was inheriting 'right' from the kJ label → sat below centre)
+  ctx.fillText('Temp °C', 0, 0)
+  ctx.restore()
+
+  // Target-temperature line (set via the GO box): dotted horizontal line + its value.
+  if (targetTempLine != null && targetTempLine >= 0 && targetTempLine <= tMax) {
+    const ly = pT + ph - (targetTempLine / tMax) * ph
+    ctx.strokeStyle = darkMode ? '#ffb060' : '#c05000'; ctx.lineWidth = 1.5; ctx.setLineDash([4, 4])
+    ctx.beginPath(); ctx.moveTo(pL, ly); ctx.lineTo(pL + pw, ly); ctx.stroke()
+    ctx.setLineDash([])
+    ctx.fillStyle = darkMode ? '#ffb060' : '#c05000'
+    ctx.font = 'bold 14px Lexend, system-ui, sans-serif'; ctx.textAlign = 'right'; ctx.textBaseline = 'bottom'
+    ctx.fillText(`${Math.round(targetTempLine)}°`, pL + pw, ly - 2)
+  }
+
+  const markers = ui ? ui.markers : []
+  // nearest curve point within 14 px of a pointer position (−1 if none)
+  const nearestOnCurve = m => {
+    let best = -1, bd = 14 * 14
+    if (m) for (let i = 0; i < n; i++) {
+      const dx = toX(xOf(hist[i])) - m.x, dy = toY(hist[i].t) - m.y, d2 = dx * dx + dy * dy
+      if (d2 < bd) { bd = d2; best = i }
+    }
+    return best
+  }
+  // where the curve crosses temperature t: [x values …], de-duplicated by screen distance
+  const crossingsAt = t => {
+    const out = []
+    for (let i = 1; i < n; i++) {
+      const a = hist[i - 1], b = hist[i]
+      if ((a.t - t) * (b.t - t) > 0 || a.t === b.t) continue
+      const xa = xOf(a), e = xa + (xOf(b) - xa) * (t - a.t) / (b.t - a.t)
+      if (!out.some(q => Math.abs(toX(q) - toX(e)) < 14)) out.push(e)
+    }
+    return out.sort((p, q) => p - q)
+  }
+  const markerAt = m => m ? markers.findIndex(mk => Math.abs(toY(mk.t) - m.y) <= 5 && m.x >= pL && m.x <= pL + pw) : -1
+
+  // ── Clicks: on a line → remove it; on the curve → add a line at that temperature ──
+  if (ui && ui.clicks.length) {
+    for (const c of ui.clicks) {
+      const hit = markerAt(c)
+      if (hit >= 0) { markers.splice(hit, 1); continue }
+      const k = nearestOnCurve(c)
+      if (k >= 0 && markers.length < GRAPH_MAX_MARKERS) markers.push({ t: Math.round(hist[k].t) })
+    }
+    ui.clicks.length = 0
+  }
+
+  if (n >= 2) {
+    ctx.strokeStyle = darkMode ? '#ff9050' : '#c04000'; ctx.lineWidth = 2.5; ctx.lineJoin = 'round'
+    ctx.beginPath()
+    for (let i = 0; i < n; i++) {
+      const x = toX(xOf(hist[i])), y = toY(hist[i].t)
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)
+    }
+    ctx.stroke()
+    // Current (live) point dot — hidden while scrubbing / replaying, where the replay ring marks "now"
+    if (!replayPt) {
+      const last = hist[n - 1]
+      ctx.fillStyle = darkMode ? '#ffcc80' : '#e05500'; ctx.beginPath(); ctx.arc(toX(xOf(last)), toY(last.t), 4, 0, Math.PI * 2); ctx.fill()
+    }
+  }
+
+  const labelBox = (parts, x, y) => {   // parts: [[text, colour], …]; drawn on a soft backing box
+    ctx.font = 'bold 12px Lexend, system-ui, sans-serif'; ctx.textBaseline = 'middle'; ctx.textAlign = 'left'
+    const widths = parts.map(([t]) => ctx.measureText(t).width), tw = widths.reduce((a, b) => a + b, 0)
+    const bx = Math.max(2, Math.min(w - tw - 10, x)), by = Math.max(2, Math.min(h - 20, y))
+    ctx.fillStyle = darkMode ? 'rgba(0,0,0,0.72)' : 'rgba(255,255,255,0.85)'
+    ctx.fillRect(bx, by, tw + 8, 18)
+    let cx = bx + 4
+    parts.forEach(([t, col], k) => { ctx.fillStyle = col; ctx.fillText(t, cx, by + 9); cx += widths[k] })
+  }
+  const textCol = darkMode ? '#ccc' : '#444'
+
+  // ── Marker lines: dotted horizontal at a fixed temperature, dot at each curve crossing ──
+  for (const mk of markers) {
+    const y = toY(mk.t), cross = crossingsAt(mk.t)
+    const xEnd = cross.length ? Math.min(pL + pw, toX(cross[cross.length - 1]) + 10) : pL + 30
+    ctx.strokeStyle = tCol; ctx.lineWidth = 1.5; ctx.setLineDash([4, 4])
+    ctx.beginPath(); ctx.moveTo(pL, y); ctx.lineTo(xEnd, y); ctx.stroke()
+    ctx.setLineDash([])
+    // °C label at the line's right end, past the last crossing (falls back to just above the
+    // line's end if there's no room)
+    ctx.font = 'bold 12px Lexend, system-ui, sans-serif'
+    const tw = ctx.measureText(`${Math.round(mk.t)} °C`).width + 8
+    if (xEnd + 4 + tw <= w) labelBox([[`${Math.round(mk.t)} °C`, tCol]], xEnd + 4, y - 9)
+    else labelBox([[`${Math.round(mk.t)} °C`, tCol]], xEnd - tw, y - 22)
+    // crossing dots only (temperature-coloured) — no kJ labels on the lines
+    for (const e of cross.slice(0, 3)) {
+      ctx.fillStyle = tCol; ctx.beginPath(); ctx.arc(toX(e), y, 3.5, 0, Math.PI * 2); ctx.fill()
+    }
+  }
+
+  // ── Replay position: where the scrubbed / playing history frame sits on the curve ──
+  if (replayPt) {
+    const x = toX(xOf(replayPt)), y = toY(replayPt.t)
+    ctx.fillStyle = darkMode ? 'rgba(255,255,255,0.18)' : 'rgba(0,0,0,0.12)'
+    ctx.beginPath(); ctx.arc(x, y, 9, 0, Math.PI * 2); ctx.fill()
+    ctx.strokeStyle = darkMode ? '#fff' : '#222'; ctx.lineWidth = 2
+    ctx.beginPath(); ctx.arc(x, y, 5.5, 0, Math.PI * 2); ctx.stroke()
+  }
+
+  // ── Hover: nearest curve point within 14 px → coordinate pair with units ──
+  const mo = ui?.mouse
+  const overMarker = markerAt(mo) >= 0
+  const best = nearestOnCurve(mo)
+  if (best >= 0) {
+    const p = hist[best], x = toX(xOf(p)), y = toY(p.t)
+    ctx.strokeStyle = darkMode ? '#fff' : '#222'; ctx.lineWidth = 1.5
+    ctx.beginPath(); ctx.arc(x, y, 5, 0, Math.PI * 2); ctx.stroke()
+    labelBox([timeMode ? [`${(p.s ?? 0).toFixed(1)} s`, xCol] : [`${kJ(p.e)} kJ`, eCol], ['  ·  ', textCol], [`${Math.round(p.t)} °C`, tCol]], x + 8, y - 24)
+  }
+  // pointer = clickable (a line to remove, or the curve to annotate); empty space does nothing
+  canvas.style.cursor = (overMarker || best >= 0) ? 'pointer' : 'default'
+}
+
+function drawBarGraph(canvas, ke, pe, n) {
+  const s = setupCanvas(canvas)
+  if (!s || !n) return
+  const { ctx, w, h } = s
+  const pL = 8, pR = 8, pT = 6, pB = 18
+  const pw = w - pL - pR, ph = h - pT - pB
+
+  ctx.fillStyle = '#111'
+  ctx.fillRect(0, 0, w, h)
+
+  // Scale bars to per-particle energy, max = (2000+273)*ENERGY_UNIT
+  const E_MAX = (2000 + 273) * ENERGY_UNIT
+  const keP = ke / n, peP = pe / n
+  const barW = pw / 2 - 4
+
+  const keH = Math.min(ph, (keP / E_MAX) * ph)
+  const peH = Math.min(ph, (peP / E_MAX) * ph)
+
+  // KE bar (left)
+  ctx.fillStyle = '#c06030'
+  ctx.fillRect(pL, pT + ph - keH, barW, keH)
+  // PE bar (right)
+  ctx.fillStyle = '#4060c0'
+  ctx.fillRect(pL + barW + 8, pT + ph - peH, barW, peH)
+
+  // Baseline
+  ctx.strokeStyle = '#333'; ctx.lineWidth = 1
+  ctx.beginPath(); ctx.moveTo(pL, pT + ph); ctx.lineTo(pL + pw, pT + ph); ctx.stroke()
+
+  // Labels
+  ctx.fillStyle = '#888'; ctx.font = '9px monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'top'
+  ctx.fillText('KE', pL + barW / 2, pT + ph + 2)
+  ctx.fillText('PE', pL + barW + 8 + barW / 2, pT + ph + 2)
+
+  // Values
+  ctx.fillStyle = '#aaa'; ctx.textBaseline = 'bottom'
+  if (keH > 12) ctx.fillText((keP * 1e4).toFixed(1), pL + barW / 2, pT + ph - keH - 1)
+  if (peH > 12) ctx.fillText((peP * 1e4).toFixed(1), pL + barW + 8 + barW / 2, pT + ph - peH - 1)
+}
+
+function LegendDot({ cx, cy, r, fill, label }) {
+  return (
+    <>
+      <circle cx={cx} cy={cy} r={r} fill={fill} />
+      <text x={cx + r + 5} y={cy + 4}
+        style={{ fontSize: 10, fill: '#888', fontFamily: 'system-ui,sans-serif' }}>
+        {label}
+      </text>
+    </>
+  )
+}
+
+function countBonds(phys) {
+  const counts = { sio: { intact: 0, total: 0 }, nao: { intact: 0, total: 0 }, cao: { intact: 0, total: 0 } }
+  if (!phys?.rigidBonds || !phys?.particles) return counts
+  const ps = phys.particles
+  for (const rb of phys.rigidBonds) {
+    const ti = ps[rb.i].typeId, tj = ps[rb.j].typeId
+    const key = rb.isSiO ? 'sio' : ((ti === 2 || tj === 2) ? 'nao' : ((ti === 3 || tj === 3) ? 'cao' : null))
+    if (!key) continue
+    counts[key].total++
+    if (!rb.broken) counts[key].intact++
+  }
+  return counts
+}
+
+export default function CompositionView({ sio2Pct, na2oPct, caoPct, sioR0 = 9, attractK = 0, attractFalloff = 1, debug = false, bondNums = false, meltTemp = 50, simSpeed = 1, speedMult = 1, coolingMode = null, onTempUpdate = null, onEnergyUpdate = null, onBondCounts = null, replayFrame = null, onReplayReady = null, graphCanvasRef = null, graphUiRef = null, cumulativeEnergyRef = null, graphXMaxRef = null, darkMode = true, showCharge = false, chargeLite = false, showField = true, fieldBlur = true, interpolate = false, longerCooledBonds = true, atomColorMode = 'normal', showBrokenBonds = false, showLiveStats = false, useEmaStrain = true, hcPlateau = 4, active = true, resetToken = 0, targetTempLine = null, coolCommitted = null, heatRateRef = null, heatLeadSteps = 30, timePaused = false, replayInfoRef = null, historyRun = 0, onFrameCost = null, onCatchup = null }) {
+  const types = useMemo(
+    () => buildGrid(sio2Pct, na2oPct, caoPct),
+    [sio2Pct, na2oPct, caoPct]
+  )
+
+  const allAtoms = useMemo(() => buildAllAtoms(types, sioR0), [types, sioR0])
+
+  const cellData = useMemo(() => types.map((type, idx) => ({
+    idx,
+    type,
+    atoms: allAtoms.filter(a => a.chunkIdx === idx),
+    bonds: [],
+    pts:   null,
+    bg:        C[`bg_${type.toLowerCase()}`]  ?? C.bg_sio2,
+    bdr:       C[`bdr_${type.toLowerCase()}`] ?? C.bdr_sio2,
+  })), [types, allAtoms])
+
+  // ── Physics refs ──────────────────────────────────────────────
+  const canvasRef           = useRef(null)
+  const graphBarRef         = useRef(null)   // KE/PE bar chart canvas (unused)
+  const physRef             = useRef(null)
+  const rafRef              = useRef(null)
+  const energyValRef        = useRef(meltTemp)
+  const speedRef            = useRef(simSpeed)
+  const coolingRef          = useRef(coolingMode)
+  const graphCanvasRefRef        = useRef(graphCanvasRef)
+  const graphUiRefRef            = useRef(graphUiRef)
+  const cumulativeEnergyRefRef   = useRef(cumulativeEnergyRef)
+  const na2oPctRef               = useRef(na2oPct)
+  const targetTempLineRef        = useRef(null)
+  const hcPlateauRef             = useRef(4)
+  // When false this tab is not showing: keep the RAF alive (so the shared energy
+  // ramp still advances and the other tab can cool) but skip stepPhysics, drawing,
+  // replay recording, the graph and the bond-count callback. See the activeRef
+  // guard in the RAF loop below.
+  const activeRef                = useRef(active)
+  const graphXMaxRefRef          = useRef(graphXMaxRef)
+  const frameAccRef         = useRef(0)   // fractional sim-step accumulator (wall-clock pacing)
+  const lastTsRef           = useRef(0)   // previous frame timestamp, for elapsed-time pacing
+  const lastRampSyncRef     = useRef(0)   // throttle for the ramp → parent temperature sync
+  const coolGraphERef       = useRef(null) // during cooling: energy to plot on the graph x-axis
+  const stepCallCountRef    = useRef(0)   // diagnostic: total stepPhysics calls
+  const diagDoneRef         = useRef(false)  // diagnostic: first-10-calls log emitted
+  const smoothTempRef       = useRef(25)  // EMA of derivedTempC for stable readout
+  // Cooling/heating state (energy-based)
+  const effectiveERef       = useRef((meltTemp + 273) * ENERGY_UNIT)  // ePerParticle during ramp
+  const prevCoolingRef      = useRef(null)
+  const coolingStartERef    = useRef((meltTemp + 273) * ENERGY_UNIT)
+  const coolingFrameRef     = useRef(0)
+  // Committed cool run: the mode ('fast'|'slow') of the cool ramp in progress. Cooling is a
+  // single run — stopping it is a PAUSE, and pressing the same Cool again RESUMES the same ramp
+  // (same start, same progress, same rate, replay kept) instead of starting a new one. Cleared by
+  // a heat ramp or when the parent's coolCommitted lock is released (Reset / composition change).
+  const coolRunRef          = useRef(null)
+  // Heat lead: while GlassViewer's integrator is heating, the physics is stepped at the temperature
+  // the ramp will reach heatLeadSteps sim steps from now. Bond breaking
+  // takes ~30–40 steps to respond, so without it Na–O breakup trailed Fast Heat by 100–200 °C.
+  const heatLeadRef         = useRef(0)       // eased lead, °C
+  const heatLeadStepsRef    = useRef(heatLeadSteps)
+  heatLeadStepsRef.current  = heatLeadSteps
+  const onTempUpdateRef     = useRef(onTempUpdate)
+  const onEnergyUpdateRef   = useRef(onEnergyUpdate)
+  const attractKRef         = useRef(attractK)
+  const attractFalloffRef   = useRef(attractFalloff)
+  const speedMultRef        = useRef(speedMult)
+  const debugRef            = useRef(debug)
+  const bondNumsRef         = useRef(bondNums)
+  const darkModeRef         = useRef(darkMode)
+  const showChargeRef       = useRef(showCharge)
+  const showFieldRef        = useRef(showField)
+  const fieldBlurRef        = useRef(fieldBlur)
+  const chargeLiteRef       = useRef(chargeLite)
+  const interpolateRef      = useRef(interpolate)
+  const longerBondsRef      = useRef(longerCooledBonds)
+  const atomColorModeRef    = useRef(atomColorMode)
+  const showBrokenBondsRef  = useRef(showBrokenBonds)
+  const showLiveStatsRef    = useRef(showLiveStats)
+  const hoverIdxRef         = useRef(null)
+  const lastHoverIdxRef     = useRef(null)
+  const selectedIdxRef      = useRef(-1)
+  const replayFrameRef      = useRef(replayFrame)
+  const onReplayReadyRef    = useRef(onReplayReady)
+  // Continuous history (DVR): every RECORD_EVERY sim steps while time runs, a frame of positions +
+  // the exact drawn bonds (+ strain) + temperature + graph x. Capped at REPLAY_MAX frames by
+  // decimation (drop every other frame, double the interval) so memory stays bounded (~10 MB).
+  const replayRef           = useRef({ frames: [], every: 2, acc: 0, lastNotify: 0 })
+  const historyArmedRef     = useRef(false)   // record history only inside a run (from its Heat / Cool press)
+  const endHoldRef          = useRef(0)       // seconds of running time spent at 0 °C / 1800 °C (see END_HOLD_S)
+  const timePausedRef       = useRef(timePaused)
+  const onFrameCostRef      = useRef(onFrameCost)
+  onFrameCostRef.current    = onFrameCost
+  timePausedRef.current     = timePaused
+  const replayInfoRefRef    = useRef(replayInfoRef)
+  replayInfoRefRef.current  = replayInfoRef
+  const allFreedRef         = useRef(null)
+  const onBondCountsRef     = useRef(onBondCounts)
+  const lastBondCountTsRef  = useRef(0)
+  // Graph history — grows forever, never wraps
+  const histRef             = useRef([])   // {e, t, s}[]
+  // Trip clock for the graph's time axis (s). Runs from the trip's first Heat / Cool press at the
+  // ramps' own pace; reset with the graph. See the RAF's graph section.
+  const graphClockRef       = useRef(0)
+  const histFrameRef        = useRef(0)    // throttle: record every 3 frames
+
+  useEffect(() => { onTempUpdateRef.current = onTempUpdate }, [onTempUpdate])
+  useEffect(() => { onEnergyUpdateRef.current = onEnergyUpdate }, [onEnergyUpdate])
+  useEffect(() => { attractKRef.current = attractK }, [attractK])
+  useEffect(() => { attractFalloffRef.current = attractFalloff }, [attractFalloff])
+  useEffect(() => { speedMultRef.current = speedMult }, [speedMult])
+  useEffect(() => { debugRef.current = debug }, [debug])
+  useEffect(() => { bondNumsRef.current = bondNums }, [bondNums])
+  useEffect(() => { darkModeRef.current = darkMode }, [darkMode])
+  useEffect(() => { showChargeRef.current = showCharge }, [showCharge])
+  useEffect(() => { showFieldRef.current = showField }, [showField])
+  useEffect(() => { fieldBlurRef.current = fieldBlur }, [fieldBlur])
+  useEffect(() => { chargeLiteRef.current = chargeLite }, [chargeLite])
+  useEffect(() => { interpolateRef.current = interpolate }, [interpolate])
+  useEffect(() => { longerBondsRef.current = longerCooledBonds }, [longerCooledBonds])
+  useEffect(() => { atomColorModeRef.current = atomColorMode }, [atomColorMode])
+  useEffect(() => { showBrokenBondsRef.current = showBrokenBonds }, [showBrokenBonds])
+  useEffect(() => { showLiveStatsRef.current = showLiveStats }, [showLiveStats])
+  useEffect(() => { setUseEmaStrain(useEmaStrain) }, [useEmaStrain])
+  useEffect(() => { replayFrameRef.current = replayFrame }, [replayFrame])
+  useEffect(() => { onReplayReadyRef.current = onReplayReady }, [onReplayReady])
+  useEffect(() => { onBondCountsRef.current = onBondCounts }, [onBondCounts])
+  // A new run (Heat / Go-to, then Cool) starts a fresh replay history at the button press;
+  // historyRun 0 (page load / Reset) = no run yet → nothing recorded.
+  // The graph starts fresh at each press too: a new curve (and trip clock, and marker lines) from
+  // the press, so a cool is its own graph rather than the second half of the heat's.
+  useEffect(() => {
+    historyArmedRef.current = historyRun > 0
+    endHoldRef.current = 0
+    if (historyRun > 0) {
+      histRef.current = []; graphClockRef.current = 0
+      if (graphUiRefRef.current?.current) graphUiRefRef.current.current.markers.length = 0
+    }
+    replayRef.current = { frames: [], every: 2, acc: 0, lastNotify: 0 }
+    if (replayInfoRefRef.current) replayInfoRefRef.current.current = replayRef.current.frames
+    onReplayReadyRef.current?.(0)
+  }, [historyRun])
+  useEffect(() => { graphCanvasRefRef.current = graphCanvasRef }, [graphCanvasRef])
+  useEffect(() => { graphUiRefRef.current = graphUiRef }, [graphUiRef])
+  // Reset the energy graph when the material (composition) changes — clear the history and
+  // redraw the empty graph immediately, so stale curves don't linger even if the tab is hidden.
+  useEffect(() => {
+    histRef.current = []; graphClockRef.current = 0
+    if (graphUiRefRef.current?.current) graphUiRefRef.current.current.markers.length = 0   // markers belong to this graph
+    replayRef.current = { frames: [], every: 2, acc: 0, lastNotify: 0 }   // history belongs to this run
+    if (replayInfoRefRef.current) replayInfoRefRef.current.current = replayRef.current.frames
+    onReplayReadyRef.current?.(0)
+    const ext = graphCanvasRefRef.current?.current
+    if (ext) drawTEGraph(ext, [], darkModeRef.current, 4e-3, targetTempLineRef.current)
+  }, [sio2Pct, na2oPct, caoPct])
+  useEffect(() => { cumulativeEnergyRefRef.current = cumulativeEnergyRef }, [cumulativeEnergyRef])
+  useEffect(() => { na2oPctRef.current = na2oPct }, [na2oPct])
+  useEffect(() => { targetTempLineRef.current = targetTempLine }, [targetTempLine])
+  useEffect(() => { hcPlateauRef.current = hcPlateau }, [hcPlateau])
+  useEffect(() => { activeRef.current = active }, [active])
+  useEffect(() => { graphXMaxRefRef.current = graphXMaxRef }, [graphXMaxRef])
+
+  // Hover highlight: mousemove tracks nearest atom for the white ring in renderer
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const toPhys = e => {
+      const rect  = canvas.getBoundingClientRect()
+      const dpr   = effectiveDpr()   // must match what drawScene used, or hit-testing desyncs
+      const W     = canvas.clientWidth, H = canvas.clientHeight
+      const scale = Math.min(W / 600, H / 350) * dpr
+      const offX  = (W * dpr - 600 * scale) / 2
+      const offY  = (H * dpr - 350 * scale) / 2
+      return [(e.clientX - rect.left) * dpr, (e.clientY - rect.top) * dpr, scale, offX, offY]
+    }
+    const onMove = e => {
+      const phys = physRef.current
+      if (!phys) return
+      const [cx, cy, scale, offX, offY] = toPhys(e)
+      hoverIdxRef.current = findAtomNear(phys, (cx - offX) / scale, (cy - offY) / scale, getVisualScale())
+    }
+    const onClick = e => {
+      const phys = physRef.current
+      if (!phys) return
+      const [cx, cy, scale, offX, offY] = toPhys(e)
+      const idx = findAtomNear(phys, (cx - offX) / scale, (cy - offY) / scale, getVisualScale())
+      if (idx < 0) return
+      selectedIdxRef.current = selectedIdxRef.current === idx ? -1 : idx
+      const p    = phys.particles[idx]
+      const lf   = phys.latticeFreed?.[idx] ?? 0
+      const ic   = phys.intactCount?.[idx]  ?? 0
+      const orig = phys.originalBondCount?.[idx] ?? '?'
+      const spd  = Math.hypot(p.vx, p.vy).toExponential(3)
+      const dist = Math.hypot(p.x - p.x0, p.y - p.y0).toFixed(1)
+      let bc = 0
+      for (const b of (phys.bonds ?? [])) { if (b.i === idx || b.j === idx) bc++ }
+      const tgt  = [3, 2, 1, 2][p.typeId] ?? 2
+      const elig = bc < tgt ? 'attract-eligible' : 'NOT attract-eligible'
+      const bondInfo = (phys.bonds ?? [])
+        .filter(b => b.i === idx || b.j === idx)
+        .map(b => {
+          const other = b.i === idx ? b.j : b.i
+          const po    = phys.particles[other]
+          const d     = Math.hypot(p.x - po.x, p.y - po.y).toFixed(1)
+          const rigid = b.currentBreakStrain !== undefined
+          const state = !rigid ? 'soft' : b.broken ? 'BRK' : 'ok'
+          const strain = rigid && b.strain != null ? b.strain.toFixed(3) : '—'
+          return `  → ${po.type}#${other}  d=${d}px  ${state}  strain=${strain}`
+        })
+      console.log(
+        `[click] atom #${idx} ${p.type} (${p.cellType})\n` +
+        `  latticeFreed: ${lf}\n` +
+        `  intactCount: ${ic}  (originalBondCount: ${orig})\n` +
+        `  bondCount(attract): ${bc}  COORD_TARGET: ${tgt}  → ${elig}\n` +
+        `  dist from x0: ${dist}px  speed: ${spd} px/step\n` +
+        `  bonds (phys.bonds):\n` + (bondInfo.length ? bondInfo.join('\n') : '  (none)')
+      )
+    }
+    canvas.addEventListener('mousemove', onMove)
+    canvas.addEventListener('click', onClick)
+    return () => { canvas.removeEventListener('mousemove', onMove); canvas.removeEventListener('click', onClick) }
+  }, [])   // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Keep the physics module's Si-O r0 in sync with the slider
+  useEffect(() => { setSiOr0(sioR0) }, [sioR0])
+
+  // Sync energy target ref when not cooling
+  useEffect(() => {
+    energyValRef.current = meltTemp
+    const ePerParticle = (meltTemp + 273) * ENERGY_UNIT
+    if (!coolingRef.current) effectiveERef.current = ePerParticle
+  }, [meltTemp])
+
+  useEffect(() => { speedRef.current = simSpeed }, [simSpeed])
+  useEffect(() => { coolingRef.current = coolingMode }, [coolingMode])
+  // The committed cool run ends only when the parent releases it (Reset / composition change) —
+  // NOT on a tab-switch rebuild, so a paused run still resumes after the melt tab is rebuilt.
+  useEffect(() => { if (!coolCommitted) coolRunRef.current = null }, [coolCommitted])
+
+  // Rebuild physics when composition changes
+  useEffect(() => {
+    physRef.current = initPhysics(cellData)
+    physRef.current.sio2Pct = sio2Pct
+    window._meltPhys = physRef.current
+    window.measureStrain95 = () => measureStrain95(window._meltPhys)
+    window.meltStructure   = () => meltStructure(window._meltPhys)
+    window.verifyHashPairs = () => verifyHashPairs(window._meltPhys)   // stage-1 hash check
+    window.setMeltHash     = setMeltHash                               // toggle hash on/off
+    // Live sim-speed tuning: lower = slower. 0.5 steps every 2nd frame, 0.25 every 4th, etc.
+    // Dial it here, then tell me the value to hard-code into simSpeed's useState default.
+    window.setSimSpeed     = (v) => { window._simSpeed = v }
+    // A handful of near-zero-temperature steps let spring forces seat atoms at r0
+    // after the dead-zone snap in initPhysics. 5 steps is enough; initPhysics
+    // already handles overlap resolution so we don't need many here.
+    const eSettle = 1 * ENERGY_UNIT
+    for (let s = 0; s < 5; s++) stepPhysics(physRef.current, eSettle)
+    buildRigidBondMap(physRef.current)
+    // Measurement-only bookkeeping arrays — no physics effect
+    const _nb = physRef.current.rigidBonds.length
+    physRef.current.everBroken      = new Uint8Array(_nb)
+    physRef.current.wasIntact       = new Uint8Array(_nb).fill(1)
+    physRef.current.currentIntact   = new Int32Array(_nb)
+    physRef.current.lifetimeTotal   = new Float64Array(_nb)
+    physRef.current.lifetimeBreaks  = new Int32Array(_nb)
+    physRef.current.totalEnergyAdded = 0
+    physRef.current.cumulativeKE    = 0
+    // Per-cation intra-grain bond index list — for whole-unit (per-Si/Na/Ca) tracking.
+    // A bond is intra-unit when both atoms share chunkIdx; inter-unit when they don't.
+    const _pArr2 = physRef.current.particles
+    const _rb2   = physRef.current.rigidBonds
+    const _unitBonds = new Array(physRef.current.n).fill(null)
+    for (let _bi = 0; _bi < _rb2.length; _bi++) {
+      const { i: _i, j: _j } = _rb2[_bi]
+      const _pi = _pArr2[_i], _pj = _pArr2[_j]
+      if (_pi.typeId !== 1 && _pj.typeId === 1 && _pi.chunkIdx === _pj.chunkIdx) {
+        if (!_unitBonds[_i]) _unitBonds[_i] = []
+        _unitBonds[_i].push(_bi)
+      }
+      if (_pj.typeId !== 1 && _pi.typeId === 1 && _pi.chunkIdx === _pj.chunkIdx) {
+        if (!_unitBonds[_j]) _unitBonds[_j] = []
+        _unitBonds[_j].push(_bi)
+      }
+    }
+    physRef.current.unitBonds = _unitBonds
+    // The fresh solid's bond counts are the "% of the original solid" baseline — report them now,
+    // before anything can break (Reset Hot replaces this state with a melt before the first draw).
+    onBondCountsRef.current?.(countBonds(physRef.current))
+    // Warm particles to the current target so the visual doesn't start cold
+    const eWarm = (energyValRef.current + 273) * ENERGY_UNIT
+    for (let s = 0; s < 20; s++) stepPhysics(physRef.current, eWarm)
+    smoothTempRef.current = energyValRef.current  // seed EMA at known target (25°C)
+    frameAccRef.current = 0
+    lastTsRef.current = 0   // restart elapsed-time pacing cleanly after a rebuild
+    setCoolBondScale(1)     // reset "longer cooled bonds" on a fresh build
+    // A fresh build is the cold (0 °C) solid. Anywhere hotter (Reset Hot) the worker supplies the
+    // state: marking this tab as just-activated makes the RAF's stale check request it before the
+    // first draw (or, if the Bulk tab is showing, when Particles is next shown).
+    lastActiveRef.current = { kind: 'heat', T: 0 }
+    wasActiveRef.current = false
+    catchingUpRef.current = false; catchReqRef.current++   // drop any in-flight catch-up (its reply is ignored)
+    histRef.current = []; graphClockRef.current = 0
+    if (graphUiRefRef.current?.current) graphUiRefRef.current.current.markers.length = 0   // markers belong to this graph
+    replayRef.current = { frames: [], every: 2, acc: 0, lastNotify: 0 }   // history belongs to this run
+    if (replayInfoRefRef.current) replayInfoRefRef.current.current = replayRef.current.frames
+    onReplayReadyRef.current?.(0)
+
+    window.bondAudit = () => {
+      const phys = physRef.current
+      if (!phys) return console.log('no physics state')
+      const p = phys.particles, lf = phys.latticeFreed
+      const rows = phys.bonds
+        .filter(b => lf?.[b.i] && lf?.[b.j])
+        .map(b => {
+          const r0s = Math.hypot(p[b.j].x0 - p[b.i].x0, p[b.j].y0 - p[b.i].y0)
+          const actualD = Math.hypot(p[b.j].x - p[b.i].x, p[b.j].y - p[b.i].y)
+          // Both atoms are freed (filter above guarantees this), so renderer uses bond.strain
+          // directly — the r0s path is bypassed by the iFreed && jFreed guard in renderer.js.
+          return {
+            pair: `${p[b.i].type}-${p[b.j].type}`,
+            r0s_orig: Math.round(r0s),
+            actualD: Math.round(actualD),
+            bondStrain: b.strain?.toFixed(3),
+            renderedStrain: b.strain?.toFixed(3),
+          }
+        })
+        .sort((a, b) => b.r0s_orig - a.r0s_orig)
+      console.log(`── freed-pair bonds (${rows.length}) ──`)
+      console.table(rows.slice(0, 20))
+      console.log('renderedStrain = bondStrain for all rows (both-freed guard active in renderer)')
+    }
+    window.setMeltTemp    = (tempC) => { energyValRef.current = tempC }
+    window.replayLength   = () => replayRef.current.frames.length   // history frames recorded this run
+    window.graphHistory   = () => histRef.current                   // graph points {e, t, s}
+    window.setSioExclMult = (v)    => setSioExclMult(v)
+    window.setBreakStrain  = (v)   => setBreakStrain(v)
+    window.setReformStrain = (v)   => setReformStrain(v)
+    window.setCrystAnchorK = (v)   => setCrystAnchorK(v)
+    window.setLiberateFrac = (v)   => setLiberateFrac(v)
+    window.setSioK         = (v)   => setSioK(v)
+    window.setNaOK         = (v)   => setNaOK(v)
+    window.getDisplacementStats = () => {
+      const phys = physRef.current
+      if (!phys?.particles) return null
+      const { particles, n } = phys
+      let sum = 0, max = 0, over9 = 0
+      for (let i = 0; i < n; i++) {
+        const p = particles[i]
+        const d = Math.hypot(p.x - p.x0, p.y - p.y0)
+        sum += d
+        if (d > max) max = d
+        if (d > 9) over9++
+      }
+      return { mean: +(sum / n).toFixed(3), max: +max.toFixed(3), over9pct: +(over9 / n * 100).toFixed(1) }
+    }
+    window.getFreedStats = () => {
+      const phys = physRef.current
+      if (!phys?.particles || !phys?.latticeFreed) return null
+      const { particles, n, latticeFreed } = phys
+      let sioTotal = 0, sioFreed = 0, naTotal = 0, naFreed = 0
+      for (let i = 0; i < n; i++) {
+        const ct = particles[i].cellType
+        if (ct === 'SiO2') { sioTotal++; if (latticeFreed[i]) sioFreed++ }
+        else if (ct === 'Na2O') { naTotal++; if (latticeFreed[i]) naFreed++ }
+      }
+      return {
+        sioFreedPct: sioTotal ? +(sioFreed / sioTotal * 100).toFixed(1) : 0,
+        naFreedPct:  naTotal  ? +(naFreed  / naTotal  * 100).toFixed(1) : 0,
+        sioFreed, sioTotal, naFreed, naTotal,
+      }
+    }
+    window.getBreakStats = () => {
+      const phys = physRef.current
+      if (!phys?.particles) return null
+      const totalKE = computeKE(phys)   // total KE of all atoms
+      return {
+        breakKERemoved:  phys.breakKERemoved  ?? 0,
+        breakKEReturned: phys.breakKEReturned ?? 0,
+        netDrain:        (phys.breakKERemoved ?? 0) - (phys.breakKEReturned ?? 0),
+        totalKE,
+        // gross fraction of total KE drained per step by bond breaking (before reforms)
+        breakPEoverKE: totalKE > 0 ? (phys.breakKERemoved ?? 0) / totalKE : 0,
+        latticeTemp: phys.latticeTemp ?? null,
+      }
+    }
+    window.setNaAnchorK         = v => setNaAnchorK(v)
+    window.setNaLiberateFrac    = v => setNaLiberateFrac(v)
+    window.setNaBreakStrain     = v => setNaBreakStrain(v)
+    window.setLatticeSpeedMult  = v => setLatticeSpeedMult(v)
+    window.setFreedSpeedMult    = v => setFreedSpeedMult(v)
+    window.resetLibStats   = () => resetLibStats()
+    window.getLibStats     = () => getLibStats()
+    window.getStrainStats = () => {
+      const phys = physRef.current
+      if (!phys?.rigidBonds) return null
+      const { particles, rigidBonds } = phys
+      const strains = []
+      for (const rb of rigidBonds) {
+        if (rb.broken) continue
+        const pi = particles[rb.i], pj = particles[rb.j]
+        const d = Math.hypot(pj.x - pi.x, pj.y - pi.y)
+        strains.push((d - rb.r0) / rb.r0)
+      }
+      if (!strains.length) return { n: 0 }
+      strains.sort((a, b) => a - b)
+      const mean = strains.reduce((s, v) => s + v, 0) / strains.length
+      const p95  = strains[Math.floor(strains.length * 0.95)]
+      const p99  = strains[Math.floor(strains.length * 0.99)]
+      const max  = strains[strains.length - 1]
+      return { n: strains.length, mean: +mean.toFixed(4), p95: +p95.toFixed(4), p99: +p99.toFixed(4), max: +max.toFixed(4) }
+    }
+    window.resetLifetimes = () => {
+      const phys = physRef.current
+      if (!phys?.lifetimeTotal) return
+      phys.lifetimeTotal.fill(0)
+      phys.lifetimeBreaks.fill(0)
+      phys.currentIntact.fill(0)
+      const rb = phys.rigidBonds
+      if (rb) for (let i = 0; i < rb.length; i++) phys.wasIntact[i] = rb[i].broken ? 0 : 1
+    }
+    window.getKERatio = () => {
+      const phys = physRef.current
+      if (!phys) return null
+      const n = phys.n
+      const ke = computeKE(phys)
+      const d  = phys.dbg || {}
+      if (d.totalEnergy == null) return null
+      const targetKE = (d.totalEnergy + 273) * ENERGY_UNIT * n
+      return { ke, targetKE, ratio: ke / targetKE, tempC: Math.round(ke / (n * ENERGY_UNIT) - 273) }
+    }
+    window.getSioStats = () => {
+      const phys = physRef.current
+      if (!phys || !phys.rigidBonds) return null
+      const { particles, rigidBonds, latticeFreed, n } = phys
+      const isBonded = new Uint8Array(n)
+      for (const b of (phys.bonds ?? [])) { if (!b.broken) { isBonded[b.i] = 1; isBonded[b.j] = 1 } }
+      const idxs = []
+      for (let i = 0; i < n; i++) if (particles[i].cellType === 'SiO2') idxs.push(i)
+      if (!idxs.length) return null
+      const nBonded = idxs.filter(i => isBonded[i]).length
+      let ltTotal = 0, ltBreaks = 0
+      for (let bi = 0; bi < rigidBonds.length; bi++) {
+        if (particles[rigidBonds[bi].i].cellType === 'SiO2') {
+          ltTotal  += phys.lifetimeTotal?.[bi]  ?? 0
+          ltBreaks += phys.lifetimeBreaks?.[bi] ?? 0
+        }
+      }
+      return {
+        bondedPct:  Math.round(nBonded / idxs.length * 100),
+        meanLifeFr: ltBreaks > 0 ? Math.round(ltTotal / ltBreaks) : null,
+      }
+    }
+    window.meltDebug = () => {
+      const phys = physRef.current
+      if (!phys) return console.log('no physics state')
+      const { particles, rigidBonds, latticeFreed, chunks } = phys
+      const n = phys.n
+      const d = phys.dbg || {}
+
+      // ── System ─────────────────────────────────────────────────────────
+      const ke              = computeKE(phys)
+      const { ke: bonKE }  = computeBondedKE(phys)
+      const bpe   = phys.bondBreakPE  ?? 0
+      const cumKE = phys.cumulativeKE ?? 0
+      const totE  = phys.totalEnergyAdded ?? 0
+      const targetKE = d.totalEnergy != null ? (d.totalEnergy + 273) * ENERGY_UNIT * n : null
+      const keRatio  = targetKE ? (ke / targetKE).toFixed(4) : '—'
+      console.log('── system ──────────────────────────────────────────────')
+      console.table({
+        'tempC (target)':   d.totalEnergy ?? Math.round(ke / (n * ENERGY_UNIT) - 273),
+        'tempC (total KE)': Math.round(ke / (n * ENERGY_UNIT) - 273),
+        'KE/target ratio':  keRatio,
+        KE:               ke.toExponential(3),
+        bondedKE:         bonKE.toExponential(3),
+        'KE/bondedKE':    bonKE > 0 ? (ke / bonKE).toFixed(3) : '—',
+        bondBreakPE:      bpe.toExponential(3),
+        cumulativeKE:     cumKE.toExponential(3),
+        'breakPE/cumKE':  cumKE > 0 ? (bpe / cumKE).toFixed(4) : '—',
+        totalEnergyAdded: totE.toExponential(3),
+        hasBeenMelted:    d.hasBeenMelted ?? '?',
+        anchorStr:        d.anchorStr     ?? '?',
+      })
+
+      if (!rigidBonds || !phys.everBroken) {
+        console.log('bond bookkeeping not yet initialized')
+        return
+      }
+
+      // Atoms with at least one live bond (rigid or dynamic, not broken)
+      const isBonded = new Uint8Array(n)
+      for (const b of (phys.bonds ?? [])) { if (!b.broken) { isBonded[b.i] = 1; isBonded[b.j] = 1 } }
+
+      // Intra-unit bond: both atoms share chunkIdx in original rigid bond map
+      const isIntraUnit = new Uint8Array(rigidBonds.length)
+      for (let bi = 0; bi < rigidBonds.length; bi++) {
+        const { i, j } = rigidBonds[bi]
+        if (particles[i].chunkIdx === particles[j].chunkIdx) isIntraUnit[bi] = 1
+      }
+
+      // ── Per-species stats ───────────────────────────────────────────────
+      // whole% = cation atoms (Si/Na/Ca) with no ever-broken intra-grain bonds / total cations
+      const CATION_TYPE = { SiO2: 0, Na2O: 2, CaO: 3 }
+      console.log('── per species ─────────────────────────────────────────')
+      const specRows = {}
+      for (const species of ['SiO2', 'Na2O', 'CaO']) {
+        const specAtomIdxs = []
+        for (let i = 0; i < n; i++) if (particles[i].cellType === species) specAtomIdxs.push(i)
+        if (!specAtomIdxs.length) continue
+
+        const cationTid = CATION_TYPE[species]
+        const cationIdxs = specAtomIdxs.filter(i => particles[i].typeId === cationTid)
+        const nAtoms      = specAtomIdxs.length
+        const nCations    = cationIdxs.length
+        const nBonded     = specAtomIdxs.filter(i => isBonded[i]).length
+        const nLiberated  = specAtomIdxs.filter(i => latticeFreed?.[i]).length
+        const nWhole   = cationIdxs.filter(i => {
+          const ub = phys.unitBonds?.[i]
+          return !ub?.length || ub.every(bi => !phys.everBroken[bi])
+        }).length
+
+        let ltTotal = 0, ltBreaks = 0
+        for (let bi = 0; bi < rigidBonds.length; bi++) {
+          const pi = particles[rigidBonds[bi].i]
+          if (pi.cellType === species) {
+            ltTotal  += phys.lifetimeTotal[bi]
+            ltBreaks += phys.lifetimeBreaks[bi]
+          }
+        }
+
+        specRows[species] = {
+          atoms:        nAtoms,
+          'bonded%':    Math.round(nBonded / nAtoms * 100) + '%',
+          'free%':      Math.round((nAtoms - nBonded) / nAtoms * 100) + '%',
+          'liberated%': Math.round(nLiberated / nAtoms * 100) + '%',
+          cations:      nCations,
+          'whole%':   nCations > 0 ? Math.round(nWhole / nCations * 100) + '%' : '—',
+          meanLifeFr: ltBreaks > 0 ? Math.round(ltTotal / ltBreaks) : '∞',
+        }
+      }
+      console.table(specRows)
+
+      // ── Bond break stats (intra-unit vs inter-unit) ─────────────────────
+      if (d.bonds) {
+        const rows = {}
+        for (const [key, s] of Object.entries(d.bonds)) {
+          rows[key] = {
+            total: s.total, broken: s.broken,
+            'broken%': Math.round(s.broken / s.total * 100),
+          }
+        }
+        console.log('── bond break stats ────────────────────────────────────')
+        console.table(rows)
+
+        // Intra vs inter breakdown from phys.bonds (all live bonds, broken excluded).
+        // intra = both atoms share chunkIdx (same original grain).
+        // inter = atoms from different grains — only possible for dynamic bonds formed in the melt.
+        const intra = { total: 0 }
+        const inter = { total: 0 }
+        for (const b of (phys.bonds ?? [])) {
+          if (b.broken) continue
+          const ci = particles[b.i].chunkIdx, cj = particles[b.j].chunkIdx
+          if (ci === cj) intra.total++
+          else           inter.total++
+        }
+        const bondTotal = intra.total + inter.total
+        console.log('── intra-grain vs inter-grain (live bonds, phys.bonds) ──')
+        console.table({
+          'intra-grain': { ...intra, '%': bondTotal ? Math.round(intra.total / bondTotal * 100) : '—' },
+          'inter-grain': { ...inter, '%': bondTotal ? Math.round(inter.total / bondTotal * 100) : '—' },
+        })
+      }
+    }
+    // resetToken: bumped by GlassViewer when this tab's frozen state is no longer
+    // valid for the current conditions (temperature moved, preset or ramp mode
+    // changed while the Bulk Material tab was showing). Re-running this effect
+    // rebuilds the melt from a fresh start state: initPhysics → 5 settling steps →
+    // buildRigidBondMap → 20 warm-up steps at the current target temperature.
+  }, [cellData, resetToken])  // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Catch-up on return from the Bulk tab ─────────────────────────────────────────────────
+  // While Bulk shows, this tab's physics is frozen but its temperature ramp keeps running. A
+  // background worker (meltTrackWorker.js) walks the physics along the standard runs (Fast Heat to
+  // 1800, then Fast / Slow Cool) at page load and keeps a full state every 40 steps. On a stale
+  // re-entry we ask it for the state at the CURRENT temperature on the current run: it restores the
+  // closest state at/behind it (stored, or the one we froze at if that's nearer) and runs the few
+  // remaining steps. Time stands still behind a loading overlay (onCatchup → GlassViewer) until the
+  // state is in place, so the view never shows the old state drifting to the new one.
+  const workerRef      = useRef(null)
+  const workerGenRef   = useRef(0)
+  const catchReqRef    = useRef(0)
+  const lastActiveRef  = useRef({ kind: 'heat', T: meltTemp })   // where the visible sim last was
+  const onCatchupRef   = useRef(onCatchup)
+  useEffect(() => { onCatchupRef.current = onCatchup }, [onCatchup])
+  useEffect(() => {
+    let w = null
+    try { w = new Worker(new URL('./meltTrackWorker.js', import.meta.url), { type: 'module' }) } catch { return }
+    workerRef.current = w
+    w.onmessage = e => {
+      const m = e.data
+      if (m.type !== 'state' || m.id !== workerGenRef.current || m.reqId !== catchReqRef.current) return
+      const phys = physRef.current
+      if (phys && m.result) {
+        restoreFull(phys, m.result.snap)
+        setCoolBondScale(m.result.snap.coolBondScale ?? 1)
+        const nb = phys.rigidBonds.length                  // resize measurement-only arrays
+        phys.everBroken     = new Uint8Array(nb)
+        phys.wasIntact      = new Uint8Array(nb).fill(1)
+        phys.currentIntact  = new Int32Array(nb)
+        phys.lifetimeTotal  = new Float64Array(nb)
+        phys.lifetimeBreaks = new Int32Array(nb)
+        window._lastCatchup = { from: m.result.from, steps: m.result.steps }
+        onBondCountsRef.current?.(countBonds(phys))   // bond table shows the new state with it, not ≤300 ms later
+      }
+      catchingUpRef.current = false
+      onCatchupRef.current?.(false)
+    }
+    return () => { w.terminate(); workerRef.current = null }
+  }, [])
+  // (Re)generate the tracks for this composition.
+  useEffect(() => {
+    const w = workerRef.current
+    if (!w) return
+    workerGenRef.current++
+    w.postMessage({ type: 'init', id: workerGenRef.current,
+      comp: { sio2: sio2Pct, na2o: na2oPct, cao: caoPct, sioR0 },
+      P: { na2o: na2oPct, plateau: hcPlateauRef.current, speed: speedRef.current, heatLeadSteps: heatLeadStepsRef.current,
+           attractK: attractKRef.current, speedMult: speedMultRef.current, attractFalloff: attractFalloffRef.current,
+           longerBonds: longerBondsRef.current } })
+  }, [cellData])  // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Called from the RAF loop on the first frame this tab is visible again — BEFORE anything steps or
+  // draws — so the frozen state can neither be shown nor nudged at the new temperature first.
+  const catchingUpRef = useRef(false)
+  const wasActiveRef  = useRef(active)
+  const beginCatchupIfStale = (phys, ePerParticle) => {
+    const w = workerRef.current
+    const kind = coolRunRef.current ?? 'heat'
+    const T = ePerParticle / ENERGY_UNIT - 273
+    const la = lastActiveRef.current
+    if (!w || (kind === la.kind && Math.abs(T - la.T) < 1)) return   // nothing moved → resume as frozen
+    const startT = coolingStartERef.current / ENERGY_UNIT - 273
+    const frozenScale = la.kind === 'heat' ? 1 : 1 + 0.1 * Math.max(0, Math.min(1, (startT - la.T) / 300))
+    catchingUpRef.current = true
+    catchReqRef.current++
+    onCatchupRef.current?.(true)
+    w.postMessage({ type: 'catchup', id: workerGenRef.current, reqId: catchReqRef.current,
+      req: { kind, T, frozen: { kind: la.kind, T: la.T, snap: snapshotFull(phys, frozenScale) } } })
+  }
+
+
+  // RAF loop
+  useEffect(() => {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current)
+
+    function frame(ts) {
+      const cm = coolingRef.current
+      const _fc0 = performance.now()   // frame work time → adaptive quality (GlassViewer)
+
+      // ── Detect ramp mode change ───────────────────────────────────
+      if (cm !== prevCoolingRef.current) {
+        if ((cm === 'fast' || cm === 'slow') && coolRunRef.current === cm) {
+          // Resume the paused cool run: keep its start energy and progress, so it carries on at
+          // the same rate and the graph continues along the same cooling path.
+        } else if (cm === 'fast' || cm === 'slow' || cm === 'fastHeat' || cm === 'slowHeat') {
+          coolRunRef.current = (cm === 'fast' || cm === 'slow') ? cm : null
+          coolingStartERef.current  = effectiveERef.current
+          coolingFrameRef.current   = 0
+        }
+        prevCoolingRef.current = cm
+      }
+
+      // ── Wall-clock pacing ─────────────────────────────────────────
+      // Advance the sim by elapsed real time, not per rendered frame, so it runs the same
+      // speed on every machine — fast hardware just draws more (smoother) frames of the same
+      // sim rate, a struggling one lags. The ramp advances by the same step count and must
+      // keep running even while THIS tab is frozen (it drives the Bulk Material tab's
+      // temperature), so it is computed here, above the activeRef gate. window._wallClock =
+      // false restores the old per-frame behaviour for A/B.
+      const nowMs = ts || performance.now()
+      let elapsed = lastTsRef.current ? (nowMs - lastTsRef.current) / 1000 : 0
+      lastTsRef.current = nowMs
+      if (elapsed > MAX_FRAME_DT) elapsed = MAX_FRAME_DT   // clamp → slow hw lags, never spirals
+      const paused = timePausedRef.current   // Pause button, or viewing history: time stands still
+      if (paused) elapsed = 0
+      const speed   = window._simSpeed ?? speedRef.current
+      const useWall = window._wallClock !== false
+      let stepsThisFrame, rampAdvance
+      if (useWall) {
+        frameAccRef.current += elapsed * BASE_STEPS_PER_SEC * speed
+        stepsThisFrame = Math.floor(frameAccRef.current)
+        frameAccRef.current -= stepsThisFrame
+        if (stepsThisFrame > MAX_STEPS_PER_FRAME) { stepsThisFrame = MAX_STEPS_PER_FRAME; frameAccRef.current = 0 }
+        rampAdvance = stepsThisFrame
+      } else if (speed >= 1) {
+        stepsThisFrame = Math.floor(speed); frameAccRef.current = 0; rampAdvance = 1
+      } else {
+        frameAccRef.current += speed
+        stepsThisFrame = frameAccRef.current >= 1 ? (frameAccRef.current -= 1, 1) : 0
+        rampAdvance = 1
+      }
+      if (paused) { stepsThisFrame = 0; rampAdvance = 0 }
+
+      // ── Compute energy target for this frame ──────────────────────
+      // All ramps are energy-based: ePerParticle = (sliderVal+273)*ENERGY_UNIT. The ramp is
+      // advanced in SIM STEPS (rampAdvance), so a cool runs a fixed number of relaxation
+      // steps regardless of frame rate — the crystallinity lesson is hardware-independent.
+      let ePerParticle
+      const isRamping = cm === 'fast' || cm === 'slow' || cm === 'fastHeat' || cm === 'slowHeat'
+      if (cm === 'fast' || cm === 'slow') {
+        coolingFrameRef.current += rampAdvance
+        const dur = coolFrames(cm, na2oPctRef.current)   // pure SiO₂'s Slow Cool runs 2× faster
+        const t   = Math.min(1, coolingFrameRef.current / dur)   // progress; advances at a constant rate
+        const slow  = cm === 'slow'
+        const Tstart = coolingStartERef.current / ENERGY_UNIT - 273
+        // Energy leaves at a CONSTANT rate: the graph x-axis moves linearly from where heating
+        // ended (energyContent(Tstart)) down to 0. Temperature is derived through the cooling
+        // heat-capacity curve, so the graph SLOPE carries the latent-heat physics (a shallow
+        // shelf 1100→500), and slow's taller hump makes that shelf even shallower than fast.
+        const eTop  = energyContent(Tstart, na2oPctRef.current, hcPlateauRef.current)
+        const cTop  = coolEnergyContent(Tstart, slow, na2oPctRef.current)
+        const scale = cTop > 0 ? eTop / cTop : 1   // normalise so the loop meets heating at the top
+        const graphE = eTop * (1 - t)              // linear in energy → constant rate on the x-axis
+        const Tnow   = coolTempForContent(graphE / scale, slow, na2oPctRef.current)
+        ePerParticle = (Tnow + 273) * ENERGY_UNIT
+        effectiveERef.current = ePerParticle
+        coolGraphERef.current = graphE             // plot this on the graph (hysteresis path)
+      } else if (cm === 'fastHeat' || cm === 'slowHeat') {
+        coolingFrameRef.current += rampAdvance
+        const dur = cm === 'fastHeat' ? FAST_COOL_FRAMES : SLOW_COOL_FRAMES
+        const t   = Math.min(1, coolingFrameRef.current / dur)
+        ePerParticle = rampEnergyLinearInContent(coolingStartERef.current, 1500, t, na2oPctRef.current, hcPlateauRef.current)
+        effectiveERef.current = ePerParticle
+        coolGraphERef.current = null   // heating uses the normal energy axis
+      } else {
+        ePerParticle = (energyValRef.current + 273) * ENERGY_UNIT   // energyValRef tracks meltTemp
+        effectiveERef.current = ePerParticle
+        // Hold uses the normal energy axis — except a PAUSED cool run, which keeps its point on
+        // the cooling (hysteresis) path so the graph doesn't jump sideways while paused.
+        if (!coolRunRef.current) coolGraphERef.current = null
+      }
+
+      // Heat lead (see heatLeadRef). Applied ONLY to the stepPhysics target below — the readout,
+      // graph and energy bookkeeping keep the true ramp temperature. Eased so it fades in/out
+      // smoothly when heating starts or stops (ceiling, GO arrival, Cool).
+      // The lead is WHERE THE RAMP WILL BE after heatLeadSteps sim steps: integrate the integrator's
+      // constant heating power forward through the heat-capacity curve (not a straight-line
+      // extrapolation, which overshot by ~2× just before the 500–750 °C heat-capacity rise).
+      {
+        const power  = cm === null ? (heatRateRef?.current?.heatPower ?? 0) : 0
+        let target = 0
+        if (power > 0 && heatLeadStepsRef.current > 0) {
+          const T0 = ePerParticle / ENERGY_UNIT - 273
+          let T = T0, budget = power * heatLeadStepsRef.current / Math.max(1e-6, BASE_STEPS_PER_SEC * speed)
+          while (budget > 1e-6 && T < 1800) {
+            const h = heatCap(T, na2oPctRef.current, hcPlateauRef.current)
+            const dT = Math.min(5, budget / h)
+            T += dT; budget -= dT * h
+          }
+          target = T - T0
+        }
+        heatLeadRef.current += (target - heatLeadRef.current) * 0.15
+      }
+      const physE = heatLeadRef.current > 0.5
+        ? (Math.min(1800, ePerParticle / ENERGY_UNIT - 273 + heatLeadRef.current) + 273) * ENERGY_UNIT
+        : ePerParticle
+
+      // Propagate slider-equivalent energy value to parent (throttled to ~10×/s by wall-clock)
+      if (onTempUpdateRef.current && isRamping && nowMs - lastRampSyncRef.current > 100) {
+        lastRampSyncRef.current = nowMs
+        onTempUpdateRef.current(Math.round(ePerParticle / ENERGY_UNIT - 273))
+      }
+
+      // "Longer cooled bonds": while cooling, ramp the rigid-bond rest length +10% over the first
+      // 300°C of the drop (9→9.9, 12→13.2), then hold it (latched). Reset to normal on reheat.
+      // The longer bonds expand the network into the voids so the solid reads as continuous.
+      if (longerBondsRef.current && (cm === 'fast' || cm === 'slow')) {
+        const startT = coolingStartERef.current / ENERGY_UNIT - 273
+        const curT   = ePerParticle / ENERGY_UNIT - 273
+        setCoolBondScale(1 + 0.1 * Math.max(0, Math.min(1, (startT - curT) / 300)))
+      } else if (cm === 'fastHeat' || cm === 'slowHeat' || !longerBondsRef.current) {
+        setCoolBondScale(1)   // reheating, or feature off → normal bond lengths
+      }
+      // (cm === null hold: leave the latched value in place)
+
+      // ── Energy graph: record + draw ABOVE the activeRef gate ──────
+      // The graph plots the ramp's target temperature vs energy, which comes entirely from the
+      // energy ramp above (ePerParticle / coolGraphERef) — not from stepPhysics. Running it here,
+      // outside the gate, means the Bulk Material tab drives the SAME graph identically (the
+      // temperature is shared), and switching tabs or scrubbing benchmarks stays continuous.
+      // Trip clock: heating advances at the integrator's pace (its 0.05 s frame clamp), cooling by the
+      // cool ramp's own sim-step progress — so the time-axis slopes are the real heating / cooling
+      // rates on any machine. Runs only inside a trip (from the first Heat / Cool press), stands
+      // still while time is stopped, and stops END_HOLD_S after the ramp reaches 0 / 1800 °C so a
+      // long wait at the end doesn't squash the curve (same rule as the replay history).
+      if (historyArmedRef.current && endHoldRef.current <= END_HOLD_S) {
+        graphClockRef.current += (cm === 'fast' || cm === 'slow')
+          ? rampAdvance / (BASE_STEPS_PER_SEC * speed)
+          : Math.min(elapsed, 0.05)
+      }
+      if (!paused) histFrameRef.current++
+      if (histFrameRef.current >= 3) {
+        histFrameRef.current = 0
+        const targetTempC = Math.max(0, Math.round(ePerParticle / ENERGY_UNIT - 273))
+        // During cooling, plot the cooling-energy path (constant-rate x, latent-heat slope);
+        // otherwise the normal energy axis. This draws the heat-up/cool-down hysteresis loop.
+        const xVal = coolGraphERef.current ?? energyContent(targetTempC, na2oPctRef.current, hcPlateauRef.current)
+        histRef.current.push({ e: xVal, t: targetTempC, s: graphClockRef.current })
+      }
+      {
+        const extCanvas = graphCanvasRefRef.current?.current
+        if (extCanvas) {
+          const eMax = energyContent(1800, na2oPctRef.current, hcPlateauRef.current) * 1.05
+          const rfG = replayFrameRef.current
+          const replayPt = rfG != null ? replayRef.current.frames[rfG] : null
+          drawTEGraph(extCanvas, histRef.current, darkModeRef.current, eMax, targetTempLineRef.current, graphUiRefRef.current?.current, replayPt)
+        }
+      }
+
+      // History end: once the ramp sits at a limit (1800 °C after heating, 0 °C after cooling), keep
+      // recording END_HOLD_S of running time, then stop — no long tail of an unchanging state.
+      {
+        const Tr = ePerParticle / ENERGY_UNIT - 273
+        if (Tr <= 0.5 || Tr >= 1799.5) endHoldRef.current += elapsed
+        else endHoldRef.current = 0
+      }
+
+      const phys = physRef.current
+      // activeRef gate: everything above this point is cheap bookkeeping that must
+      // keep running while the other tab is showing — the energy-content ramp above
+      // is the sole temperature driver for Slow/Fast Cool, and the Bulk Material tab
+      // reads that temperature. Everything below is the expensive part (stepPhysics,
+      // drawScene, replay capture, the graph, bond counts) and is frozen with the tab.
+      const act = activeRef.current
+      if (act && !wasActiveRef.current && phys) beginCatchupIfStale(phys, ePerParticle)
+      wasActiveRef.current = act
+      if (phys && act && !catchingUpRef.current) {
+        const rf = replayFrameRef.current
+
+        // ── Replay mode: draw a recorded frame WITHOUT touching the live sim ──
+        // A display copy of phys gets the frame's positions and its exact drawn bonds; every atom
+        // is drawn at its true position (all "freed"), and the frame's own temperature drives the
+        // thermal colouring. Time is stopped while viewing history (GlassViewer pauses).
+        const fr = rf !== null ? replayRef.current.frames[rf] : null
+        if (fr) {
+          const ps = phys.particles, n = ps.length
+          if (!allFreedRef.current || allFreedRef.current.length !== n) allFreedRef.current = new Uint8Array(n).fill(1)
+          const dps = new Array(n)
+          for (let i = 0; i < n; i++) { const x = fr.pos[i * 2], y = fr.pos[i * 2 + 1]; dps[i] = { ...ps[i], x, y, px: x, py: y } }
+          const nb = fr.bonds.length / 2, bonds = new Array(nb)
+          for (let k = 0; k < nb; k++) bonds[k] = { i: fr.bonds[k * 2], j: fr.bonds[k * 2 + 1], strain: fr.strain[k] / 100, currentBreakStrain: 0.25, broken: false }
+          // Grain outlines: this frame's own recorded dissolve state (a COPY — the live record
+          // must never be touched), frozen so the renderer doesn't re-judge it.
+          const disp = { ...phys, particles: dps, bonds, latticeFreed: allFreedRef.current,
+                         chunkDissolved: fr.dissolved ? fr.dissolved.slice() : undefined, dissolveFrozen: true }
+          drawScene(canvasRef.current, disp, { ts, bondNums: bondNumsRef.current, darkMode: darkModeRef.current, showCharge: showChargeRef.current, chargeLite: chargeLiteRef.current, showField: showFieldRef.current, fieldBlur: fieldBlurRef.current, atomColorMode: atomColorModeRef.current, showBrokenBonds: false, showLiveStats: showLiveStatsRef.current, targetTempC: fr.t, cooling: !!fr.c, hoverIdx: null, selectedIdx: -1 })
+          rafRef.current = requestAnimationFrame(frame)
+          return
+        }
+
+        lastActiveRef.current = { kind: coolRunRef.current ?? 'heat', T: ePerParticle / ENERGY_UNIT - 273 }
+        // Run the sim steps scheduled for this frame by the wall-clock pacer above.
+        for (let s = 0; s < stepsThisFrame; s++) {
+          for (const p of phys.particles) { p.px = p.x; p.py = p.y }
+          stepPhysics(phys, physE, 1.0, attractKRef.current, cm, speedMultRef.current, attractFalloffRef.current)
+          stepCallCountRef.current++
+          if (!diagDoneRef.current && stepCallCountRef.current <= 10) {
+            const meanSpd = phys.particles.reduce((s, p) => s + Math.hypot(p.vx, p.vy), 0) / phys.n
+            console.log(`[diag] stepPhysics call #${stepCallCountRef.current}: coolingFactor=1.0 speedMult=${speedMultRef.current.toFixed(3)} ePerParticle=${ePerParticle.toExponential(3)} meanSpeed=${meanSpd.toExponential(3)} cm=${cm}`)
+            if (stepCallCountRef.current === 10) diagDoneRef.current = true
+          }
+        }
+
+        // Hi-Res interpolation: draw freed atoms `frameAccRef` of the way into the next step
+        // (the unconsumed time fraction), so motion is smooth between physics steps. 1 = off.
+        const interpAlpha = interpolateRef.current ? Math.min(1, frameAccRef.current) : 1
+        drawScene(canvasRef.current, phys, { ts, bondNums: bondNumsRef.current, darkMode: darkModeRef.current, showCharge: showChargeRef.current, chargeLite: chargeLiteRef.current, showField: showFieldRef.current, fieldBlur: fieldBlurRef.current, interp: interpAlpha, atomColorMode: atomColorModeRef.current, showBrokenBonds: showBrokenBondsRef.current, showLiveStats: showLiveStatsRef.current, targetTempC: Math.round(ePerParticle / ENERGY_UNIT - 273), cooling: !!coolRunRef.current, hoverIdx: hoverIdxRef.current, selectedIdx: selectedIdxRef.current })
+
+        // ── KE / PE diagnostics + graph history ──────────────────────
+        const ke = computeKE(phys)
+        const pe = computePE(phys) + (phys.bondBreakPE ?? 0)
+        // latticeTemp = keTarget/ENERGY_UNIT-273: thermostat's intended temperature,
+        // free of wander-clamp KE corruption. Drops below totalEnergy when PE rises.
+        const rawTempC = Math.max(0, computeKE(phys) / (phys.n * ENERGY_UNIT) - 273)
+        smoothTempRef.current = smoothTempRef.current * 0.92 + rawTempC * 0.08
+        const derivedTempC = Math.round(smoothTempRef.current)
+        onEnergyUpdateRef.current?.(ke, pe, derivedTempC, effectiveERef.current, phys.fBroken ?? 0, phys.meanAvgStrain ?? 0, phys.sevFireRate ?? 0, phys.meanEffThreshold ?? 0, phys.maxAvgStrain ?? 0)
+        // ── Per-frame measurement bookkeeping (no physics effect) ─────────
+        if (phys.wasIntact) {
+          const rb = phys.rigidBonds
+          for (let _i = 0; _i < rb.length; _i++) {
+            if (!rb[_i].broken) {
+              phys.currentIntact[_i]++
+              phys.wasIntact[_i] = 1
+            } else {
+              phys.everBroken[_i] = 1
+              if (phys.wasIntact[_i]) {
+                phys.lifetimeTotal[_i]  += phys.currentIntact[_i]
+                phys.lifetimeBreaks[_i]++
+                phys.currentIntact[_i]   = 0
+                phys.wasIntact[_i]       = 0
+              }
+            }
+          }
+          phys.totalEnergyAdded += ePerParticle * phys.n
+          phys.cumulativeKE     += ke
+        }
+
+        // ── Record history frame (DVR) ────────────────────────────────
+        if (stepsThisFrame > 0 && historyArmedRef.current && endHoldRef.current <= END_HOLD_S) {
+          const R = replayRef.current
+          R.acc += stepsThisFrame
+          if (R.acc >= R.every) {
+            R.acc = 0
+            const ps = phys.particles, n = ps.length
+            const pos = new Float32Array(n * 2)
+            for (let i = 0; i < n; i++) { pos[i * 2] = ps[i].x; pos[i * 2 + 1] = ps[i].y }
+            const live = phys.bonds.filter(b => !b.broken)
+            const bonds = new Uint16Array(live.length * 2), strain = new Int8Array(live.length)
+            for (let k = 0; k < live.length; k++) {
+              bonds[k * 2] = live[k].i; bonds[k * 2 + 1] = live[k].j
+              strain[k] = Math.max(-127, Math.min(127, Math.round((live[k].strain ?? 0) * 100)))
+            }
+            const t = Math.max(0, Math.round(ePerParticle / ENERGY_UNIT - 273))
+            const e = coolGraphERef.current ?? energyContent(t, na2oPctRef.current, hcPlateauRef.current)
+            // grains only ever go intact → dissolved, so a 20-byte copy per frame lets playback pop
+            // each outline back in exactly up to the frame it dissolved on
+            const dissolved = phys.chunkDissolved ? phys.chunkDissolved.slice() : null
+            R.frames.push({ pos, bonds, strain, t, e, s: graphClockRef.current, dissolved, c: !!coolRunRef.current })
+            if (R.frames.length > REPLAY_MAX) { R.frames = R.frames.filter((_, k) => k % 2 === 0); R.every *= 2 }
+            if (replayInfoRefRef.current) replayInfoRefRef.current.current = R.frames
+            if (nowMs - R.lastNotify > 400) { R.lastNotify = nowMs; R.notified = R.frames.length; onReplayReadyRef.current?.(R.frames.length) }
+          }
+        } else if (endHoldRef.current > END_HOLD_S && replayRef.current.notified !== replayRef.current.frames.length) {
+          const R = replayRef.current   // recording just ended: report the final length (the throttle may have skipped it)
+          R.notified = R.frames.length; onReplayReadyRef.current?.(R.frames.length)
+        }
+
+        // Bond counts (throttled to ~3×/s)
+        if (onBondCountsRef.current && phys.rigidBonds && ts - lastBondCountTsRef.current > 300) {
+          lastBondCountTsRef.current = ts
+          onBondCountsRef.current(countBonds(phys))
+        }
+        // live, active, time running → a representative frame for adaptive quality
+        if (!timePausedRef.current) onFrameCostRef.current?.(performance.now() - _fc0)
+      }
+      rafRef.current = requestAnimationFrame(frame)
+    }
+    rafRef.current = requestAnimationFrame(frame)
+    return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current) }
+  }, [])  // eslint-disable-line react-hooks/exhaustive-deps
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
+      {/* Main sim area — canvas fills 100%, graph overlaid at bottom edge when active */}
+      <div style={{ position: 'relative', flex: 1, minHeight: 0 }}>
+        <canvas ref={canvasRef} style={{ display: 'block', width: '100%', height: '100%' }} />
+        {showLiveStats && (
+          <button
+            onClick={() => navigator.clipboard?.writeText(getLastHudLines().join('\n'))}
+            style={{
+              position: 'absolute', top: 6, right: 6,
+              background: 'rgba(0,0,0,0.65)', color: '#aaa',
+              border: '1px solid #555', borderRadius: 3,
+              fontSize: 10, padding: '2px 6px', cursor: 'pointer',
+              fontFamily: 'monospace', userSelect: 'none',
+            }}
+          >copy</button>
+        )}
+      </div>
+    </div>
+  )
+}

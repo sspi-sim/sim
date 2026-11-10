@@ -1,3 +1,7 @@
 # macOS Finder view settings — written into any folder you open in a window.
 # Nothing to do with the site.
 .DS_Store
+
+# Build tooling for the Vite sims (their built sites in glass/ and concrete/ ARE committed)
+glass-src/node_modules
+concrete-src/node_modules

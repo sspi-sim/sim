@@ -1,0 +1,3256 @@
+import { useState, useCallback, useEffect, useRef } from 'react'
+import CompositionView, { GRAPH_PAD, GRAPH_TIME_COL } from './CompositionView'
+import { initParticles, stepPhysics, stepFloorPhysics, PARTICLE_R, FIXED_DT, T_RIGID, freezeParticles, syncParticlesToRigidBody, stepRigidBody } from './glassPhysics.js'
+import { setSioHotMult, setFreeAttractSiOMult, setSioExclMult, setCrystJiggleMult, setBreakStrain, setReformStrain, setCrystAnchorK, setLiberateFrac, setSioK, setNaOK, setNaAnchorK, setNaLiberateFrac, setNaBreakStrain, setLatticeSpeedMult, setFreedSpeedMult, setReintBondN, setReintFrameM, setBreakStrainSpread, setSevTriggerDist, setGrainFeedback, setCoolStrainScaled, setCoolHoldBonds, setBondLockTemp, setBondHyst, setCrystTemplate, setTemplK, setTemplHi, setTemplReint, setFeedbackGainMult, setSiSiRepR0, setMotifStrength, setMotifAlign, setBondStiffMult, setFreedTau, setNaNaRepR0, setSevCooldown, setSevPullK } from './meltPhysics.js'
+import { setVisualScale, setMaxDpr, effectiveDpr, setMotionCold, setMotionFullT, QTY_COLORS, ENERGY_KJ_MULT } from './renderer.js'
+import { initSandParticles, stepSandPhysics, mergeSodaGrains, mergeSilicateGrains, convertLargeNaGrains, stepNaBlobSprings, checkNaBlobMerges, absorbNearbyGrains, snapshotSand, restoreSand, GRAIN_R as SAND_GRAIN_R, NA_BLOB_R_CTR, setNaHardenTemp, setNaRigidTemp, setGlassWallPad } from './sandPhysics.js'
+import { T as GT, setCoolBand, coolGreyFrac } from './glassTemps.js'
+import { macroMeltFrac, macroMeltTarget, meldSandFrame, MELT_DRIVE_TEMP, makeBulkGenState, stepBulkGen, pickBulkCandidate, PARTICLE_FB_END, setBulkMeltLead } from './bulkMelt.js'
+import { BULK_CANDIDATES } from './candidates.generated.js'   // precomputed melt snapshots (dev-regenerated, bundled)
+import './GlassViewer.css'
+
+// ── ScrubSlider — machined-thumb horizontal scrubber (matches concrete v4) ──
+const THUMB_W = 20
+function ScrubSlider({ value, onChange, disabled }) {
+  const trackRef  = useRef(null)
+  const dragging  = useRef(false)
+  const onChangeCb = useRef(onChange)
+  useEffect(() => { onChangeCb.current = onChange }, [onChange])
+
+  useEffect(() => {
+    function onMove(e) {
+      if (!dragging.current || !trackRef.current) return
+      const rect = trackRef.current.getBoundingClientRect()
+      onChangeCb.current(Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)))
+    }
+    function onUp() {
+      if (dragging.current) { dragging.current = false; document.body.style.cursor = '' }
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+    return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp) }
+  }, [])
+
+  function onMouseDown(e) {
+    if (disabled || !trackRef.current) return
+    const rect = trackRef.current.getBoundingClientRect()
+    onChangeCb.current(Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)))
+    dragging.current = true
+    document.body.style.cursor = 'grabbing'
+    e.preventDefault()
+  }
+
+  const pct = `${value * 100}%`
+  return (
+    <div ref={trackRef} onMouseDown={onMouseDown} style={{
+      position: 'relative', flex: 1, height: 30, display: 'flex', alignItems: 'center',
+      opacity: disabled ? 0.32 : 1, userSelect: 'none',
+    }}>
+      <div style={{
+        position: 'absolute', left: 0, right: 0, height: 5, borderRadius: 3,
+        background: 'linear-gradient(180deg, rgba(0,0,0,0.55) 0%, rgba(18,12,6,0.70) 100%)',
+        boxShadow: 'inset 0 2px 3px rgba(0,0,0,0.65), inset 0 -1px 0 rgba(255,255,255,0.04)',
+      }} />
+      <div style={{
+        position: 'absolute', left: 0, width: pct, height: 5, borderRadius: 3,
+        background: 'linear-gradient(180deg, rgba(180,138,72,0.50) 0%, rgba(130,96,44,0.32) 100%)',
+        pointerEvents: 'none',
+      }} />
+      <div style={{
+        position: 'absolute', left: pct, transform: 'translateX(-50%)',
+        width: THUMB_W, height: 30, borderRadius: 4,
+        background: 'linear-gradient(180deg, #5c5040 0%, #3e3428 52%, #2c2418 100%)',
+        border: '1px solid rgba(160,130,80,0.32)',
+        boxShadow: [
+          'inset 0 1px 0 rgba(220,190,130,0.16)',
+          'inset 0 -1px 0 rgba(0,0,0,0.55)',
+          '0 0 0 1px rgba(0,0,0,0.65)',
+          '0 3px 5px rgba(0,0,0,0.65)',
+          '0 6px 12px rgba(0,0,0,0.38)',
+        ].join(', '),
+        cursor: disabled ? 'default' : 'grab',
+        display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 3.5,
+        zIndex: 1, pointerEvents: 'none',
+      }}>
+        {[0,1,2,3].map(i => (
+          <div key={i} style={{ width: 10, height: 1.5, borderRadius: 1, background: 'rgba(200,170,100,0.30)' }} />
+        ))}
+      </div>
+    </div>
+  )
+}
+
+// Glass tab: visual-only atom type assignment (does not affect physics)
+const GLASS_TYPE_COLORS = ['#d4a020', '#cc3a3a', '#4aaa60', '#4a96be']  // Si, O, Na, Ca
+const GLASS_TYPE_R      = [5.0,       3.0,       3.5,       4.5]
+function assignGlassTypes(n, sio2, na2o, cao) {
+  const nSi = sio2, nO = sio2 * 2 + na2o + cao, nNa = na2o * 2, nCa = cao
+  const tot = nSi + nO + nNa + nCa
+  const out = new Uint8Array(n)
+  for (let i = 0; i < n; i++) {
+    const r = Math.random() * tot
+    if (r < nSi)             out[i] = 0
+    else if (r < nSi + nO)   out[i] = 1
+    else if (r < nSi + nO + nNa) out[i] = 2
+    else                      out[i] = 3
+  }
+  return out
+}
+
+// Atom icon for the sidebar key — matches concrete v4 BondIcon sizing (r × 1.5 scale)
+// Charge overlay is rendered directly on the atom via box-shadow glow (no separate key section)
+function GlassAtomIcon({ type, iconR, showCharge = false, darkMode = true }) {
+  const FILL   = { Si: '#d4a020', O: '#cc3a3a', Na: '#4aaa60', Ca: '#4a96be' }
+  const CHGRGB = { Si: '62,127,214', Ca: '62,127,214', Na: '62,127,214', O: '231,131,42' }
+  const fill = FILL[type] ?? '#aaa'
+  const rgb  = CHGRGB[type]
+  const diam = iconR * 2
+  const total = diam + iconR * 2   // glow pad = 1 radius each side
+  return (
+    <div style={{ width: total, height: total, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+      <div style={{
+        position: 'relative',
+        width: diam, height: diam, borderRadius: '50%',
+        background: fill,
+        boxShadow: [
+          `0 0 0 0.5px ${darkMode ? 'rgba(255,255,255,0.40)' : 'rgba(0,0,0,0.25)'}`,
+          `0 0 ${iconR * 1.5}px ${fill}99`,
+        ].join(', '),
+      }}>
+        {/* Charge halo drawn ON TOP of the atom (matches the particle-canvas charge overlay),
+            not as an outer box-shadow behind it. */}
+        {showCharge && rgb && (
+          <div style={{
+            position: 'absolute', inset: `-${iconR * 0.6}px`, borderRadius: '50%',
+            background: `radial-gradient(circle, rgba(${rgb},0.80) 0%, rgba(${rgb},0.45) 42%, rgba(${rgb},0) 72%)`,
+            pointerEvents: 'none',
+          }} />
+        )}
+      </div>
+    </div>
+  )
+}
+
+const PRESETS = [
+  { id: 'pure', label: 'Pure SiO₂', sio2: 100, na2o: 0,  cao: 0, nGrains: 1800 },
+  { id: 'soda', label: 'Na₂O + SiO₂', sio2: 70,  na2o: 30, cao: 0, nGrains: 2250 },
+]
+
+const BOX_SIZE    = 320
+
+// Shadow color for the outer glow — separate from the fill color
+function glassGlowColor(tempC) {
+  const t = Math.max(0, Math.min(1, (tempC - 25) / (1200 - 25)))
+  const stops = [
+    [0.00, [40,  10,  3, 0.0]],
+    [0.15, [100, 18,  5, 0.5]],
+    [0.45, [220, 55, 10, 0.8]],
+    [0.70, [255, 110, 18, 0.95]],
+    [1.00, [255, 170, 45, 1.0]],
+  ]
+  for (let i = 1; i < stops.length; i++) {
+    if (t <= stops[i][0]) {
+      const f = (t - stops[i-1][0]) / (stops[i][0] - stops[i-1][0])
+      const c0 = stops[i-1][1], c1 = stops[i][1]
+      return `rgba(${~~(c0[0]+(c1[0]-c0[0])*f)},${~~(c0[1]+(c1[1]-c0[1])*f)},${~~(c0[2]+(c1[2]-c0[2])*f)},${(c0[3]+(c1[3]-c0[3])*f).toFixed(2)})`
+    }
+  }
+  return 'rgba(255,170,45,1.0)'
+}
+
+// Fill + glow ramp for sil blobs — #c87333 copper at formation, warms to gold
+// Stops are [t, [r,g,b]] where t = (tempC - 700) / 800 (range 700–1500°C).
+// Colors are midpoints between avg-sand and Na measured at each temperature.
+// t = (tempC - 700) / 800, range 700–1500°C — clamped above 1500°C
+const _BLOB_STOPS = [
+  [0.000, [199, 178, 161]],  //  700°C — extrapolated  #c7b2a1
+  [0.375, [213, 159, 125]],  // 1000°C — measured      #d59f7d
+  [0.542, [219, 151, 115]],  // 1133°C — measured      #db9773
+  [0.769, [225, 136,  89]],  // 1315°C — measured      #e18859
+  [1.000, [237, 128,  65]],  // 1500°C — measured      #ed8041
+]
+function blobFillColor(tempC) {
+  if (tempC < 700) {
+    // Darken from warm pinkish (700°C) toward near-black (25°C) — same feel as glassColor
+    const tc = Math.max(0, (tempC - 25) / (700 - 25))
+    return `rgb(${~~(30 + (199-30)*tc)},${~~(12 + (178-12)*tc)},${~~(5 + (161-5)*tc)})`
+  }
+  const t = Math.max(0, Math.min(1, (tempC - 700) / 800))
+  for (let i = 1; i < _BLOB_STOPS.length; i++) {
+    if (t <= _BLOB_STOPS[i][0]) {
+      const f = (t - _BLOB_STOPS[i-1][0]) / (_BLOB_STOPS[i][0] - _BLOB_STOPS[i-1][0])
+      const [r1,g1,b1] = _BLOB_STOPS[i-1][1], [r2,g2,b2] = _BLOB_STOPS[i][1]
+      return `rgb(${~~(r1+(r2-r1)*f)},${~~(g1+(g2-g1)*f)},${~~(b1+(b2-b1)*f)})`
+    }
+  }
+  return 'rgb(237,128,65)'
+}
+function blobGlowColor(tempC) {
+  if (tempC < 700) return 'rgba(0,0,0,0)'
+  const t = Math.max(0, Math.min(1, (tempC - 700) / 800))
+  for (let i = 1; i < _BLOB_STOPS.length; i++) {
+    if (t <= _BLOB_STOPS[i][0]) {
+      const f = (t - _BLOB_STOPS[i-1][0]) / (_BLOB_STOPS[i][0] - _BLOB_STOPS[i-1][0])
+      const [r1,g1,b1] = _BLOB_STOPS[i-1][1], [r2,g2,b2] = _BLOB_STOPS[i][1]
+      const alpha = 0.20 + 0.25 * t
+      return `rgba(${~~(r1+(r2-r1)*f)},${~~(g1+(g2-g1)*f)},${~~(b1+(b2-b1)*f)},${alpha.toFixed(2)})`
+    }
+  }
+  return 'rgba(237,128,65,0.45)'
+}
+
+// Temperature → glass fill color (blackbody-ish ramp for molten glass)
+const _GLASS_STOPS = [
+  [0.00, [50,  22,  8]],
+  [0.25, [148, 22,  5]],
+  [0.45, [230, 72, 12]],
+  [0.65, [255, 148, 28]],
+  [0.85, [255, 218, 88]],
+  [1.00, [255, 252, 190]],
+]
+function glassColorRGB(tempC) {
+  const t = Math.max(0, Math.min(1, (tempC - 25) / (1200 - 25)))
+  for (let i = 1; i < _GLASS_STOPS.length; i++) {
+    if (t <= _GLASS_STOPS[i][0]) {
+      const f = (t - _GLASS_STOPS[i-1][0]) / (_GLASS_STOPS[i][0] - _GLASS_STOPS[i-1][0])
+      const [r1,g1,b1] = _GLASS_STOPS[i-1][1], [r2,g2,b2] = _GLASS_STOPS[i][1]
+      return [~~(r1+(r2-r1)*f), ~~(g1+(g2-g1)*f), ~~(b1+(b2-b1)*f)]
+    }
+  }
+  return [255, 252, 190]
+}
+function glassColor(tempC) {
+  const [r,g,b] = glassColorRGB(tempC)
+  return `rgb(${r},${g},${b})`
+}
+
+// Tint the box's whole background by the active energy flow: slightly reddish while heating,
+// light bluish while cooling, settling back to the neutral base (gray for the blob, dark for
+// sand) as it fully cools or goes idle. The wash grows with temperature, so a cooling solid
+// fades from bluish back to gray as it reaches the floor. `heatAmt`/`coolAmt` are 0..1 wash
+// strengths the caller eases toward 1 while that flow is active and 0 once it stops, so the wash
+// fades out when heating/cooling auto-shuts off at a limit instead of snapping off in one frame.
+function boxBgTint(baseR, baseG, baseB, heatAmt, coolAmt, grayAmt, tempC) {
+  const [r, g, b] = boxBgTintRGB(baseR, baseG, baseB, heatAmt, coolAmt, grayAmt, tempC)
+  return `rgb(${r},${g},${b})`
+}
+// Same as boxBgTint, as numbers — the cooled glass paints this exact colour under its body.
+function boxBgTintRGB(baseR, baseG, baseB, heatAmt, coolAmt, grayAmt, tempC) {
+  // grayAmt (0..1) lifts the background from its dark base toward a light neutral gray. The caller
+  // ramps it in only while COOLING, so the box is black through heating/hot holds (gray looks bad
+  // behind raw grains) and gray once cooled (so the cooled glass is visible). Gray: window._glassBgGray.
+  const lift = Math.max(0, Math.min(1, grayAmt))
+  const LG = window._glassBgGray ?? 150
+  const bR = baseR + (LG - baseR) * lift
+  const bG = baseG + (LG - baseG) * lift
+  const bB = baseB + (LG - baseB) * lift
+  let r = bR, g = bG, b = bB
+  if (heatAmt > 0.002) {
+    const k = (0.12 + 0.20 * Math.max(0, Math.min(1, (tempC - 300) / 1200))) * Math.min(1, heatAmt)
+    r = bR + (255 - bR) * k
+    g = bG * (1 - k * 0.5)
+    b = bB * (1 - k * 0.6)
+  } else if (coolAmt > 0.002) {
+    const k = (0.10 + 0.22 * Math.max(0, Math.min(1, (tempC - 35) / 1200))) * Math.min(1, coolAmt)
+    r = bR * (1 - k * 0.45)
+    g = bG + (235 - bG) * k * 0.45
+    b = bB + (255 - bB) * k
+  }
+  return [Math.round(r), Math.round(g), Math.round(b)]
+}
+
+// ── Na₂O blob outline helpers ─────────────────────────────────────────────
+function convexHull(pts) {
+  if (pts.length < 3) return pts
+  const s = [...pts].sort((a, b) => a.x !== b.x ? a.x - b.x : a.y - b.y)
+  const cross = (O, A, B) => (A.x - O.x) * (B.y - O.y) - (A.y - O.y) * (B.x - O.x)
+  const lo = [], hi = []
+  for (const p of s) {
+    while (lo.length >= 2 && cross(lo[lo.length - 2], lo[lo.length - 1], p) <= 0) lo.pop()
+    lo.push(p)
+  }
+  for (let i = s.length - 1; i >= 0; i--) {
+    const p = s[i]
+    while (hi.length >= 2 && cross(hi[hi.length - 2], hi[hi.length - 1], p) <= 0) hi.pop()
+    hi.push(p)
+  }
+  hi.pop(); lo.pop()
+  return [...lo, ...hi]
+}
+
+function buildNaBlobPath(ctx, blob) {
+  const orbs = blob.particles.filter(p => p.type === 'na-sub')
+  if (orbs.length < 3) return false
+  let cx = 0, cy = 0
+  for (const p of orbs) { cx += p.x; cy += p.y }
+  cx /= orbs.length; cy /= orbs.length
+  const surf = orbs.map(c => {
+    const dx = c.x - cx, dy = c.y - cy, d = Math.hypot(dx, dy) || 1
+    return { x: c.x + c.r * dx / d, y: c.y + c.r * dy / d }
+  })
+  const hull = convexHull(surf)
+  const h = hull.length
+  if (h < 3) return false
+  ctx.beginPath()
+  ctx.moveTo(hull[0].x, hull[0].y)
+  for (let i = 0; i < h; i++) {
+    const p0 = hull[(i - 1 + h) % h], p1 = hull[i]
+    const p2 = hull[(i + 1) % h],     p3 = hull[(i + 2) % h]
+    ctx.bezierCurveTo(
+      p1.x + (p2.x - p0.x) / 6, p1.y + (p2.y - p0.y) / 6,
+      p2.x - (p3.x - p1.x) / 6, p2.y - (p3.y - p1.y) / 6,
+      p2.x, p2.y
+    )
+  }
+  ctx.closePath()
+  return true
+}
+
+const CORNER_R    = 26
+const STICK_LEN   = 300
+const STICK_ANGLE = 10 * Math.PI / 180
+
+// Heat capacity multiplier — temperature rises slower in the melt zone.
+// Matches the Na-O break zone from the graph markers (650–1130°C).
+// Effective heat capacity for the melt-tab temperature integrator (slope of T vs energy = 1/hc).
+// Na₂O-bearing mixes step up once as the flux starts melting (~650–750°C) and then stay on a
+// flat plateau — no drop back to 1, which produced a sharp slope kink at 1130°C.
+// Scaled by Na₂O fraction (30% = full plateau); pure SiO₂ stays at 1 (no melting below 1600°C).
+const HC_RAMP_LO = 500, HC_RAMP_HI = 750
+function meltHeatCapacity(tempC, na2oPct, plateau) {
+  const amp = (plateau - 1) * Math.min(1, na2oPct / 30)
+  if (amp <= 0 || tempC <= HC_RAMP_LO) return 1.0
+  const t = Math.min(1, (tempC - HC_RAMP_LO) / (HC_RAMP_HI - HC_RAMP_LO))
+  return 1.0 + amp * t * t * (3 - 2 * t)   // smoothstep
+}
+
+// Energy content = ∫₀ᵀ hc·dT, the quantity plotted on the graph x-axis (NOT temperature).
+// The kJ readout is this × an arbitrary scale, so it moves at the graph's constant x-rate.
+function energyContentKJ(T, na2oPct, plateau) {
+  let c = 0
+  for (let x = 5; x <= T; x += 5) c += meltHeatCapacity(x, na2oPct, plateau) * 5
+  return c
+}
+
+// Bulk melt progression (macroMeltFrac / macroMeltTarget / meldSandFrame, candidate generator) lives
+// in bulkMelt.js — shared with scripts/gen-candidates.mjs so the bundled snapshots can't drift.
+
+// Heat-up catch-up: when the Bulk tab becomes visible after the temperature changed on the
+// (frozen) Particles tab, fast-forward the melt to the degree it WOULD have reached — melting
+// toward macroMeltTarget(targetTemp) behind the loading overlay, then revealing the result.
+// Internal temperature the meld chain runs at during catch-up. Melt PROGRESSION is decoupled
+// from the actual temperature (the chain's own 700/1000/1200 °C gates would otherwise stall it
+// at moderate temps); macroMeltTarget(T) alone decides HOW MUCH melts, so the catch-up reaches
+// exactly the same melt degree the live loop targets at that temperature.
+function runHeatReplayChunk(phys, s, HS, box, isSoda, fast = false) {
+  const R = s.heatReplay
+  const settleEvery = window._replaySettleEvery ?? 4
+  // Hidden behind the loading overlay → run flat-out (big budget) so it finishes in 1–2 frames.
+  const budgetMs    = fast ? (window._replayFastMsPerTick ?? 90) : (window._replayMsPerTick ?? 12)
+  const soakK       = window._replaySoakK   ?? 5
+  const soakCap     = window._replaySoakCap ?? 8000   // safety iteration cap (frame-equivalents)
+  const goal = isSoda ? macroMeltTarget(R.target) : 0  // melt to the temperature's matched degree
+  if (R.soak === undefined) R.soak = 0
+  const deadline = performance.now() + budgetMs
+  while (goal > 0 && macroMeltFrac(phys) < goal && R.soak < soakCap && performance.now() < deadline) {
+    meldSandFrame(phys, MELT_DRIVE_TEMP, isSoda, soakK, R.target)
+    if (R.frame % settleEvery === 0) {
+      stepNaBlobSprings(phys.naBlobs, FIXED_DT, box.boxAngle, R.target)
+      stepSandPhysics(phys.sandParticles, FIXED_DT, HS, box.boxAngle, phys.naBlobs)
+      checkNaBlobMerges(phys.naBlobs, phys.blobMct, phys.sandParticles, R.target)
+    }
+    R.frame++
+    R.soak += soakK
+  }
+  if (goal <= 0 || macroMeltFrac(phys) >= goal || R.soak >= soakCap) {
+    for (let i = 0; i < 12; i++) stepSandPhysics(phys.sandParticles, FIXED_DT, HS, box.boxAngle, phys.naBlobs)
+    s.temp = R.target
+    s.heatReplay = null
+  }  // else: still melting — stays hidden behind the loading overlay until it reaches the goal
+}
+
+const COOL_MIN_TEMP = 1500   // Slow/Fast Cool only engage from a full melt
+
+// Lookup tables for the per-pixel glass lighting (was Math.pow/sqrt per pixel per frame).
+const _FRES_N = 1024, _FRES_MAX_G = 24, _FRES_SCALE = _FRES_N / _FRES_MAX_G
+const _FRES_LUT = new Float32Array(_FRES_N).map((_, i) => { const g = i / _FRES_SCALE; return Math.pow(1 - 1 / Math.sqrt(1 + g * g), 2.2) })
+const _LIT_LUT  = new Float32Array(256).map((_, i) => Math.pow(i / 255, 1.3))
+
+// ── Bulk-tab section profiler (console: bulkPerf(); off unless window._bulkProf) ──
+// Accumulates CPU ms per section of the Bulk frame. Canvas draws are queued, so a section's ms
+// is its JS + command cost plus any synchronous raster it forces (filters, getImageData).
+const _bp = { acc: {}, frames: 0, steps: 0, t: 0 }
+const bpStart = () => { if (window._bulkProf) _bp.t = performance.now() }
+const bpMark  = name => { if (!window._bulkProf) return; const n = performance.now(); _bp.acc[name] = (_bp.acc[name] ?? 0) + n - _bp.t; _bp.t = n }
+if (typeof window !== 'undefined') {
+  window.bulkPerf = (reset = true) => {
+    const f = Math.max(1, _bp.frames), rows = {}
+    let tot = 0
+    for (const [k, v] of Object.entries(_bp.acc)) { rows[k] = +(v / f).toFixed(2); tot += v / f }
+    rows['= TOTAL ms/frame'] = +tot.toFixed(2); rows['physics steps/frame'] = +(_bp.steps / f).toFixed(2)
+    console.table(rows)
+    if (reset) { _bp.acc = {}; _bp.frames = 0; _bp.steps = 0 }
+    return rows
+  }
+}
+
+// ── Performance tier: startup speed test (ported verbatim from ssp/bonds) ─────────
+// Same two micro-benchmarks and thresholds as the bonds sim, so a tier means the same machine
+// class across sims. Both draw to an offscreen canvas and force a GPU→CPU sync (getImageData),
+// take the min of two timed passes (cold start excluded). The TRAIL time decides the tier:
+//   ≤ 8 ms → hires · 8–13 → detailed · > 13 → simple   (bonds' extra 'low' tier, > 40 ms, maps
+//   to simple here — glass has no lower tier — and is flagged so the dropdown shows it red).
+// The result is also the auto-quality CEILING: runtime adaptation may step below it, never above.
+const PERF_PARTICLE_RADIUS = 10   // bonds' PARTICLE_RADIUS — part of the benchmark, keep identical
+function _runPerfBenchmark() {
+  const oc = document.createElement('canvas')
+  oc.width = 300; oc.height = 300
+  const dc = oc.getContext('2d')
+  const R = PERF_PARTICLE_RADIUS
+  function _draw100() {
+    for (let i = 0; i < 100; i++) {
+      const x = 15 + (i % 10) * 27, y = 15 + Math.floor(i / 10) * 27
+      const g1 = dc.createRadialGradient(x, y, 0, x, y, R * 1.1)
+      g1.addColorStop(0, '#ff1a65'); g1.addColorStop(0.82, '#ff1a65'); g1.addColorStop(1, 'rgba(0,0,0,0)')
+      dc.fillStyle = g1; dc.beginPath(); dc.arc(x, y, R * 1.1, 0, Math.PI * 2); dc.fill()
+      const g2 = dc.createRadialGradient(x, y, 0, x, y, R)
+      g2.addColorStop(0, '#ff80b0'); g2.addColorStop(0.5, '#ff80b0'); g2.addColorStop(1, 'rgba(0,0,0,0)')
+      dc.save(); dc.shadowColor = '#ff80b0'; dc.shadowBlur = 8; dc.globalAlpha = 0.82
+      dc.fillStyle = g2; dc.beginPath(); dc.arc(x, y, R, 0, Math.PI * 2); dc.fill()
+      dc.restore(); dc.globalAlpha = 1
+    }
+    dc.getImageData(0, 0, 1, 1)   // GPU→CPU sync
+  }
+  for (let i = 0; i < 40; i++) {   // warm-up: JIT, shader compile, readback path
+    const x = 15 + (i % 8) * 35, y = 15 + Math.floor(i / 8) * 35
+    const g = dc.createRadialGradient(x, y, 0, x, y, R)
+    g.addColorStop(0, '#ff1a65'); g.addColorStop(1, 'rgba(0,0,0,0)')
+    dc.fillStyle = g; dc.beginPath(); dc.arc(x, y, R, 0, Math.PI * 2); dc.fill()
+  }
+  dc.getImageData(0, 0, 1, 1)
+  const t0 = performance.now(); _draw100(); const r0 = performance.now() - t0
+  const t1 = performance.now(); _draw100(); const r1 = performance.now() - t1
+  return Math.min(r0, r1)
+}
+function _runTrailBenchmark() {
+  const oc = document.createElement('canvas')
+  oc.width = 800; oc.height = 600
+  const dc = oc.getContext('2d')
+  dc.lineCap = 'round'; dc.lineJoin = 'round'; dc.lineWidth = 1.5
+  const _nB = 32, trailLen = 140
+  const colors = ['#4488ff', '#44ff44', '#ff66cc']
+  const trails = Array.from({ length: 10 }, (_, t) =>
+    Array.from({ length: trailLen }, (_, i) => [
+      100 + (t % 5) * 130 + Math.sin(i * 0.22 + t * 1.3) * 45,
+      70  + Math.floor(t / 5) * 260 + i * 2.2 + Math.cos(i * 0.17 + t) * 22,
+    ]))
+  function _drawTrails() {
+    for (let ci = 0; ci < colors.length; ci++) {
+      dc.strokeStyle = colors[ci]
+      for (let b = 0; b < _nB; b++) {
+        dc.globalAlpha = ((b + 1) / _nB) * 0.75
+        dc.beginPath()
+        for (const pts of trails) {
+          const np = pts.length
+          const i0 = Math.round(b / _nB * (np - 1))
+          const i1 = Math.round((b + 1) / _nB * (np - 1))
+          if (i1 <= i0) continue
+          dc.moveTo(pts[i0][0], pts[i0][1])
+          for (let i = i0 + 1; i <= i1; i++)
+            dc.quadraticCurveTo(pts[i - 1][0], pts[i - 1][1], (pts[i - 1][0] + pts[i][0]) / 2, (pts[i - 1][1] + pts[i][1]) / 2)
+        }
+        dc.stroke()
+      }
+    }
+    dc.getImageData(0, 0, 1, 1)
+  }
+  _drawTrails(); dc.getImageData(0, 0, 1, 1)
+  const t0 = performance.now(); _drawTrails(); const r0 = performance.now() - t0
+  const t1 = performance.now(); _drawTrails(); const r1 = performance.now() - t1
+  return Math.min(r0, r1)
+}
+// Runs once per page load (memoised). Returns { grad, trail, tier, low }.
+let _speedTest = null
+function detectPerformanceTier() {
+  if (_speedTest) return _speedTest
+  try {
+    const grad = _runPerfBenchmark(), trail = _runTrailBenchmark()
+    const tier = trail > 13 ? 'simple' : trail > 8 ? 'detailed' : 'hires'
+    _speedTest = { grad, trail, tier, low: trail > 40 }
+  } catch { _speedTest = { grad: NaN, trail: NaN, tier: null, low: false } }
+  return _speedTest
+}
+
+// Runtime adaptive quality (bonds' algorithm, same constants): the startup test scores the
+// machine once, but capacity drifts (thermal throttling, battery saver, other tabs, heavier
+// states). Both tabs report their real per-frame WORK time; the median of the last 40 samples
+// steps the tier down when it can't keep up and back up when there's lots of headroom. Cooldown,
+// a ceiling (never auto-exceed the startup/user pick) and an anti-oscillation lock stop flapping.
+const Q_TIERS = ['simple', 'detailed', 'hires']
+const ADAPT = { window: 40, cooldownMs: 2500, minSamples: 20, downFactor: 0.9, oscWindowMs: 12000 }
+const qBudgetMs = q => q === 'hires' ? 16.7 : 33.3
+const _median = arr => { const a = arr.slice().sort((x, y) => x - y), m = a.length >> 1; return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2 }
+
+const QUALITY_DEFAULT = 'detailed'
+
+// Per-tier render caps. Keep this the single place that decides what a tier gives up.
+//
+// Measured at 4x CPU throttle (our stand-in for an old Chromebook), the melt tab is
+// ~53% native canvas rasterisation and ~26% physics JS; the Bulk Material tab is
+// ~45% rasterisation and ~34% stepSandPhysics. So the caps target raster first and
+// grain count second — not the melt physics, which is deferred to a spatial hash.
+const QUALITY = {
+  // Hi-Res — everything in 'detailed' plus frame interpolation: freed atoms are drawn between
+  // physics steps so motion is buttery even when the sim steps less often than the display
+  // refreshes. Only worth it on hardware with frames to spare (it's a draw-time lerp, cheap,
+  // but pointless on machines that can't render the extra frames). Detection never selects it;
+  // it is a manual opt-in from the dev panel.
+  hires: {
+    physBudgetMs:    14,     // Bulk: max physics ms per frame before dropping backlog (see box loop)
+    bondStrainField: true,
+    chargeGradient:  true,
+    interpolate:     true,
+    maxDpr:          2,
+    sandGrainScale:  1,
+    blobGlowBlur:    true,
+  },
+  // Full fidelity. maxDpr 2 is not a downgrade for a normal 1x or 2x panel; it only
+  // clamps the pathological case of a high-DPI panel plus browser zoom.
+  detailed: {
+    physBudgetMs:    12,
+    bondStrainField: true,
+    chargeGradient:  true,
+    interpolate:     false,
+    maxDpr:          2,
+    sandGrainScale:  1,
+    blobGlowBlur:    true,
+  },
+  // Weak machines.
+  //  · bondStrainField — gates ONLY the field's full-canvas blur(2px) (~7 ms/frame), not the
+  //    field itself. On 'simple' the strain field still draws (crisp lens shapes, composited),
+  //    so "strained bond → pink" survives; only the Gaussian is dropped. See renderer fieldBlur.
+  //  · maxDpr 1 — the biggest single render win: dpr 2 costs 2.2x per melt frame, and
+  //    devicePixelRatio tracks browser zoom, so this also caps a zoomed-in student.
+  //    Cost: atoms look slightly soft on a high-DPI panel.
+  //  · sandGrainScale — PARKED AT 1. Halving it measured 68 -> 30 ms/frame on the
+  //    Bulk tab (the single biggest win available there), but it is NOT SAFE YET:
+  //    the melt-progression calls are rate-limited per FRAME with absolute caps —
+  //    mergeSilicateGrains(..., maxMerges: 3) and convertLargeNaGrains' "one per
+  //    frame" — so halving the grain count roughly doubles the FRACTION of the pile
+  //    that melts per frame, and sand visibly melts faster on 'simple'. Screenshots
+  //    confirmed it: the pile reads as flat orange goo instead of discrete grains
+  //    turning into blobs. Make those rates frame-rate- and count-independent first
+  //    (see "Frame-rate-coupled behaviour" in CLAUDE.md), then set this to 0.5.
+  //  · blobGlowBlur — drops the decorative outer heat-glow blurs (up to blur(12px),
+  //    full canvas). The metaball mask that gives the blob its shape is kept, so the
+  //    melt still reads as a blob.
+  // Atoms, bonds, grains and the blob all still draw: every interaction being taught
+  // survives this tier. Only soft glows and resolution go.
+  simple: {
+    physBudgetMs:    8,
+    bondStrainField: false,
+    chargeGradient:  false,   // charge halos still draw, but as flat discs (no per-atom gradient)
+    interpolate:     false,
+    maxDpr:          1,
+    sandGrainScale:  1,
+    blobGlowBlur:    false,
+  },
+}
+const qualityCaps = tier => QUALITY[tier] ?? QUALITY[QUALITY_DEFAULT]
+
+export default function GlassViewer() {
+  const [darkMode,   setDarkMode]   = useState(true)
+  const tabGroupRef = useRef(null)
+  const toolbarRef  = useRef(null)
+  const [showGraph, setShowGraph] = useState(true)   // energy graph panel (both tabs)
+  const [showCount, setShowCount] = useState(true)   // bond-count table (Particles tab only) — shown above the graph
+  const [showGoBox, setShowGoBox] = useState(false)  // dev: show the temperature + GO box
+  const graphCanvasRef  = useRef(null)
+  // Graph interaction: raw pointer state written here, resolved + drawn by CompositionView's
+  // drawTEGraph (it owns the curve data). mouse = hover point; clicks = queued click points.
+  const graphUiRef      = useRef({ mouse: null, clicks: [], markers: [], xMode: 'time' })
+  // Graph x-axis: 'time' (default) | 'energy', picked from the dropdown on the x-axis label.
+  const [graphXMode, setGraphXMode]       = useState('time')
+  const [graphMenuOpen, setGraphMenuOpen] = useState(false)
+  const graphMenuRef = useRef(null)
+  graphUiRef.current.xMode = graphXMode
+  useEffect(() => {   // click anywhere outside the open menu closes it
+    if (!graphMenuOpen) return
+    const close = e => { if (!graphMenuRef.current?.contains(e.target)) setGraphMenuOpen(false) }
+    document.addEventListener('mousedown', close)
+    return () => document.removeEventListener('mousedown', close)
+  }, [graphMenuOpen])
+  const graphXMaxRef    = useRef(5000)
+  const graphDragRef    = useRef(null)   // { startX, startXMax } while dragging
+  const [showCharge, setShowCharge] = useState(false)
+  const [showField,  setShowField]  = useState(true)
+  const [showDev,    setShowDev]    = useState(false)
+  const [longerCooledBonds, setLongerCooledBonds] = useState(true)   // dev: lengthen bonds +10% while cooling
+
+  // Performance tier. detectPerformanceTier() is a stub returning null until the
+  // real speed test is dropped in (see the top of this file), so this currently
+  // always resolves to QUALITY_DEFAULT. The dev panel can override it by hand.
+  const [quality, setQuality] = useState(() => detectPerformanceTier().tier ?? QUALITY_DEFAULT)
+  const qualityRef = useRef(quality)
+  qualityRef.current = quality
+  // Adaptive-quality state (see ADAPT). Ceiling = startup verdict, or the user's manual pick.
+  const adaptRef = useRef({ ceiling: detectPerformanceTier().tier ?? QUALITY_DEFAULT, auto: true, costs: [],
+                            lastAt: 0, via: 'init', enteredAt: 0, lastMedian: 0 })
+  // Called by both tabs' RAF loops with that frame's work time (ms). Stable identity.
+  const recordFrameCost = useRef(ms => {
+    const A = adaptRef.current
+    A.costs.push(ms); if (A.costs.length > ADAPT.window) A.costs.shift()
+    if (!A.auto) return
+    const now = performance.now()
+    if (now - A.lastAt < ADAPT.cooldownMs || A.costs.length < ADAPT.minSamples) return
+    const q = qualityRef.current, med = A.lastMedian = _median(A.costs), budget = qBudgetMs(q)
+    const cur = Q_TIERS.indexOf(q), ceil = Q_TIERS.indexOf(A.ceiling)
+    let next = null, via = null
+    if (med > budget * ADAPT.downFactor && cur > 0) {
+      if (A.via === 'up' && now - A.enteredAt < ADAPT.oscWindowMs) A.ceiling = Q_TIERS[cur - 1]   // flapping → lock lower
+      next = Q_TIERS[cur - 1]; via = 'down'
+    } else if (cur < ceil) {
+      const upFactor = Q_TIERS[cur + 1] === 'hires' ? 0.15 : 0.40
+      if (med < budget * upFactor) { next = Q_TIERS[cur + 1]; via = 'up' }
+    }
+    if (next) {
+      A.via = via; A.enteredAt = now; A.lastAt = now; A.costs.length = 0
+      if (window._perfLog) console.log(`[adapt] ${via} → ${next}  (median ${med.toFixed(1)} ms, budget ${budget.toFixed(1)} ms)`)
+      setQuality(next)
+    }
+  }).current
+  // Manual pick (dropdown / dev panel): authoritative — becomes the ceiling, clears any lock.
+  const pickQuality = q => {
+    const A = adaptRef.current
+    A.ceiling = q; A.via = 'manual'; A.enteredAt = A.lastAt = performance.now(); A.costs.length = 0
+    setQuality(q)
+  }
+  useEffect(() => {
+    window.perfReport = () => {
+      const A = adaptRef.current, st = detectPerformanceTier()
+      console.table({ quality: qualityRef.current, ceiling: A.ceiling, autoQuality: A.auto,
+        'median frame work': A.costs.length ? _median(A.costs).toFixed(1) + ' ms' : '—',
+        'frame budget': qBudgetMs(qualityRef.current).toFixed(1) + ' ms', samples: A.costs.length,
+        enteredVia: A.via, 'speed test grad': st.grad?.toFixed(1) + ' ms', 'speed test trail': st.trail?.toFixed(1) + ' ms' })
+    }
+    window.setAutoQuality = on => { adaptRef.current.auto = !!on; if (!on) adaptRef.current.costs.length = 0; return adaptRef.current.auto }
+  }, [])
+  const caps = qualityCaps(quality)
+  // The strain field is available on both tiers; 'simple' just draws it crisp (no blur) via
+  // fieldBlur, because the blur — not the field itself — is the expensive part.
+  const fieldAllowed      = true
+  const fieldBlur         = caps.bondStrainField
+  const chargeLite        = !caps.chargeGradient   // Simple draws flat charge discs
+  const interpolate       = !!caps.interpolate      // Hi-Res interpolates freed atoms between steps
+  const effectiveShowField = showField && fieldAllowed
+  // The RAF closures are created once with [] deps, so they read caps through a ref.
+  const capsRef = useRef(caps)
+
+  const [tab, setTab]             = useState('melt')
+
+  // ── One tab simulates at a time ───────────────────────────────────────────
+  // The particle melt ('melt' tab, "Particles and Fields") and the bulk-material
+  // box sim ('glass' tab, "Bulk Material") are never stepped or drawn in the same
+  // frame. Both stay MOUNTED so their state survives a switch and the two can be
+  // A/B'd instantly, but the inactive one is frozen: no stepPhysics, no draw.
+  //
+  // A frozen state is only reusable while the conditions it was computed under
+  // still hold. meltResetToken / boxResetToken bump when they don't, which rebuilds
+  // that tab from a fresh start state at the current conditions.
+  const tabRef = useRef('melt')
+  const [meltResetToken, setMeltResetToken] = useState(0)
+  // Conditions each tab's frozen state is valid for; null = currently active / unknown.
+  const frozenCondRef = useRef({ melt: null, glass: null })
+  const [presetId, setPresetId]   = useState('soda')
+  const [meltEnergyIn,   setMeltEnergyIn]   = useState(0)    // -100..100, snaps to 0
+  const [meltLocalTemp,  setMeltLocalTemp]  = useState(0)    // melt tab's own temperature
+  const [gotoTemp,       setGotoTemp]       = useState('')   // typed target temperature for GO
+  const [derivedTemp,    setDerivedTemp]    = useState(0)    // KE-measured temperature
+  const [targetE,        setTargetE]        = useState((0 + 273) * 1.62e-6)
+  const [fBroken,        setFBroken]        = useState(0)
+  const [maxAvgStrain,   setMaxAvgStrain]   = useState(0)
+  const [meanAvgStrain,  setMeanAvgStrain]  = useState(0)
+  const [meanEffThreshold, setMeanEffThreshold] = useState(0)
+  const [useEmaStrain,   setUseEmaStrain]   = useState(false)
+  const [grainFeedback,  setGrainFeedbackState] = useState(true)   // per-grain Si-O break feedback
+  const [coolStrainScaled, setCoolStrainScaledState] = useState(true)   // cooling: strain vs the longer-bond rest length
+  const [coolHoldBonds,  setCoolHoldBondsState]  = useState(true)   // cooling above the cryst lock: no strain breaks
+  const [motionCold,     setMotionColdState]  = useState(0.1)   // lattice jiggle at 0 °C (× full), render only
+  const [motionFullT,    setMotionFullTState] = useState(500)   // °C where jiggle reaches full
+  const [coolBand,       setCoolBandState]    = useState({ hi: 1000, lo: 500, w: 150 })   // cooling band (glassTemps COOL_BAND): particle pink fade + Bulk glass crossfade
+  const [bulkLead,       setBulkLeadState]    = useState(0)     // Bulk melt lead (+) / lag (−) vs the particle curve, °C
+  const [heatLeadSteps,  setHeatLeadSteps] = useState(30)
+  const [glassLook,      setGlassLookState]     = useState({ rim: 2.0, dark: 0.10, gain: 9, lightDeg: 180 })
+  const [naHardenT,      setNaHardenTState]     = useState(900)   // Bulk glass starts hardening
+  const [naRigidT,       setNaRigidTState]      = useState(500)   // Bulk glass fully rigid
+  const [glassWallPad,   setGlassWallPadState]  = useState(7)     // Bulk: hardening glass stops this × orb r off the walls (drawn edge overhang)
+  const [bondLockTemp,   setBondLockTempState]  = useState(400)   // cooling: bonds lock in here (fast + slow)
+  const [crystTemplate,  setCrystTemplateState] = useState(true)   // slow cool re-grows the sand honeycomb
+  const [templK,         setTemplKState]        = useState(0.05)
+  const [templHi,        setTemplHiState]       = useState(1050)   // = CRYST_LOCK: no net bonds above it
+  const [bondHyst,       setBondHystState]      = useState(1.10)   // drawn-bond hysteresis (flicker damping)
+  const [templReint,     setTemplReintState]    = useState(300)   // particle physics runs this many sim steps ahead of a heating ramp
+  const [sevTriggerDist, setSevTriggerDistState] = useState(13)
+  const [feedbackGainMult, setFeedbackGainMultState] = useState(40)
+  const [sevFireRate,    setSevFireRate]    = useState(0)
+  const [simSpeed, setSimSpeed]   = useState(0.3)   // was 0.5; hash ~2× the frame rate, so the
+                                                    // per-frame pace was doubled. Live-tune via
+                                                    // window.setSimSpeed(x), then lock the value here.
+  const [sioR0, setSioR0]         = useState(9)
+  const [attractK, setAttractK]         = useState(0)   // 0.10 over-densified cooled solid (local density 7–8 vs crystal 4.6)
+  const [attractFalloff, setAttractFalloff] = useState(1.0)
+  const [speedMult, setSpeedMult]       = useState(1.0)
+  const [sioHotMult, setSioHotMultState]       = useState(1.07)
+  const [freeAttractSiOMult, setFreeAttractSiOMultState] = useState(1.0)
+  const [sioExclMult, setSioExclMultState]     = useState(1.4)
+  const [siSiRepR0,     setSiSiRepR0State]     = useState(15.6)
+  const [naNaRepR0,     setNaNaRepR0State]     = useState(35)
+  const [sevCooldown,   setSevCooldownState]   = useState(60)
+  const [sevPullK,      setSevPullKState]      = useState(0.01)
+  const [freedTau,      setFreedTauState]      = useState(0.01)
+  const [bondStiffMult, setBondStiffMultState] = useState(1.0)
+  const [hcPlateau,     setHcPlateau]          = useState(4)
+  const [motifStrength, setMotifStrengthState] = useState(0.004)
+  const [motifAlign,    setMotifAlignState]    = useState(0.5)
+  const [crystJiggleMult, setCrystJiggleMultState] = useState(1.0)
+  const [sioK,        setSioKState]       = useState(0.061)
+  const [naOK,        setNaOKState]       = useState(0.042)
+  const [breakStrain, setBreakStrainState] = useState(0.04)
+  const [reformStrain,  setReformStrainState]  = useState(0.0)
+  const [crystAnchorK,  setCrystAnchorKState]  = useState(0.06)
+  const [liberateFrac,  setLiberateFracState]  = useState(0.5)
+  const [naAnchorK,     setNaAnchorKState]     = useState(0.06)
+  const [naLiberateFrac, setNaLiberateFracState] = useState(0.5)
+  const [naBreakStrain,     setNaBreakStrainState]     = useState(0.02)
+  const [breakStrainSpread, setBreakStrainSpreadState] = useState(0.15)
+  const [latticeSpeedMult, setLatticeSpeedMultState] = useState(1.0)
+  const [freedSpeedMult,   setFreedSpeedMultState]   = useState(5)
+  const [reintBondN,       setReintBondNState]       = useState(2)
+  const [reintFrameM,      setReintFrameMState]      = useState(30)
+  const [visualScale, setVisualScaleState]     = useState(3.3)
+  const [coolingMode, setCoolingMode] = useState(null)
+  const [meltHeatMode, setMeltHeatMode] = useState(null)  // 'slow' | 'fast' | null
+  // Runs can't be paused or re-sped: the first Heat press locks both Heat buttons for the rest of
+  // the trip (until Reset Cold / Reset Hot / a composition button), and so does any Cool press.
+  // Ref mirrors the state so the stable callbacks can read it.
+  const [heatLocked, setHeatLocked] = useState(false)
+  const heatLockedRef = useRef(false)
+  // The committed cool mode ('slow' | 'fast'): the first Cool pressed is the run, and both Cool
+  // buttons lock (no pause, no speed switch). Cleared only by a hard reset.
+  const [coolLocked, setCoolLocked] = useState(null)
+  const coolLockedRef = useRef(null)
+  const [bondNums, setBondNums]       = useState(false)
+  const [atomColorMode,   setAtomColorMode]   = useState('normal')
+  const [showBrokenBonds, setShowBrokenBonds] = useState(false)
+  const [showLiveStats,   setShowLiveStats]   = useState(false)
+  const [showMiniView, setShowMiniView] = useState(false)
+  const [bondCounts,        setBondCounts]        = useState(null)
+  const [initialBondCounts, setInitialBondCounts] = useState(null)
+  // Bond-count reference for the "Change" row: counts at the moment the current run began, and which
+  // run ('heat' | 'cool'). Set once per run (stop/restart keeps it); cleared by Reset / composition.
+  const [bondRef,           setBondRef]           = useState(null)
+  const bondPhaseRef           = useRef(null)
+  const [historyRun,        setHistoryRun]        = useState(0)   // bumps at each run start → CompositionView restarts the replay history (0 = no run → not recording)
+  const strainUpdateTimeRef    = useRef(0)
+  const initialBondCapturedRef = useRef(false)
+  const bondCountsRef          = useRef(null)
+  const [replayFrameCount, setReplayFrameCount] = useState(0)
+  const [replayFrame, setReplayFrame]     = useState(null)
+  const [replayPlaying, setReplayPlaying] = useState(false)   // false | 'slow' (turtle) | 'fast' (rabbit)
+  // Pause: stops time everywhere (particle physics, heat integrator, cooling ramps, graph, Bulk sim
+  // + rotation). Viewing history (replayFrame != null) also stops time — a DVR, not a second sim.
+  const [timePaused, setTimePaused] = useState(false)
+  const timeStoppedRef = useRef(false)
+  const replayInfoRef  = useRef([])   // CompositionView's recorded frames ({t, e, …}) for readouts
+  const replayRafRef = useRef(null)
+
+  // Glass tab controls
+  const [autoRotate,   setAutoRotate]   = useState(true)
+  const [glassTemp,       setGlassTemp]       = useState(600)
+  const [glassEnergyIn,   setGlassEnergyIn]   = useState(0)     // -100..100, snaps to 0
+  const [glassDevMode,    setGlassDevMode]    = useState(false)
+  const [zone1End,        setZone1End]        = useState(400)
+  const [zone2End,        setZone2End]        = useState(750)
+  const [zone1Rate,       setZone1Rate]       = useState(2.0)
+  const [zone2Rate,       setZone2Rate]       = useState(0.3)
+  const [zone3Rate,       setZone3Rate]       = useState(1.5)
+  const [baseEnergyRate,  setBaseEnergyRate]  = useState(200)
+  const [boxState,        setBoxState]        = useState('sand')
+  const [sandPaused,      setSandPaused]      = useState(false)
+  const [sandDevMode,     setSandDevMode]     = useState(false)
+  const [boxLoading,      setBoxLoading]      = useState(false)   // loading overlay during heat-up replay
+  // Particles catch-up on return from Bulk (meltTrack worker): time stands still behind a loading
+  // overlay until the computed state for the current temperature is in place.
+  const [particlesLoading, setParticlesLoading] = useState(false)
+  // The run's replay history has a hole (time passed on the Bulk tab) → replay controls disabled
+  // until the next run starts a fresh history.
+  const [historyGap,      setHistoryGap]      = useState(false)
+  // A catch-up inside a run means part of that run happened unseen → no replay for it. With no run
+  // in progress (Reset Hot, then Particles) there's no history to be missing.
+  const historyRunRef = useRef(0)
+  historyRunRef.current = historyRun
+  const onParticlesCatchup = useCallback(v => { setParticlesLoading(v); if (v && historyRunRef.current > 0) setHistoryGap(true) }, [])
+  const boxLoadingRef     = useRef(false)
+  const [boxMeltFrac,     setBoxMeltFrac]     = useState(0)       // macro melt fraction (dev stat)
+  const lastMeltStatRef   = useRef(0)
+  const bulkCandidatesRef = useRef(BULK_CANDIDATES[presetId] ?? [])   // bundled Bulk melt snapshots for the preset
+  const [genProgress,     setGenProgress]     = useState(null)    // candidate generation 0..1 (null = idle)
+
+  const boxCanvasRef  = useRef(null)
+  const miniCanvasRef = useRef(null)
+  // Cooled-glass look (Bulk). Read by the box RAF loop; set by dev sliders ("Tune these").
+  //   (crossfade old fill → glass follows the shared COOL_BAND); rim: rim brightness; dark: interior opacity (near-black);
+  //   gain: edge curvature = blur radius of the height field (rim width, px); lightDeg: world light direction (for specular).
+  const glassLookRef  = useRef({ rim: 2.0, dark: 0.10, gain: 9, lightDeg: 180 })
+  // Glass look only applies to glass that has been melted and is COOLING: eases to 1 once a cool
+  // run starts, back to 0 if heating resumes; reset with the composition. Never during heating.
+  const glassGateRef  = useRef(0)
+  const gpuThreshRef  = useRef(null)   // null = untested, true/false = SVG alpha-threshold filter usable
+  const grainGroupsRef = useRef(new Map())   // per-frame colour batches for the Bulk grain draw
+  const bgGrayRef     = useRef(0)   // box background: 0 = black (heating/idle-hot), ramps to 1 (gray) while cooling
+  const bgHeatTintRef = useRef(0)   // eased 0..1 strength of the red heating wash (fades out at auto-shutoff)
+  const bgCoolTintRef = useRef(0)   // eased 0..1 strength of the blue cooling wash
+  const boxSimRef = useRef({
+    autoRotate: true, boxState: 'sand', multiRadius: true,
+    sandPaused: false, showMiniView: false,
+    temp: 25, floorMode: false, floorY: 0,
+    energyInput: 0,
+    zone1End: 400, zone2End: 750,
+    zone1Rate: 2.0, zone2Rate: 0.3, zone3Rate: 1.5,
+    baseRate: 200, lastFrameTs: 0, lastTempUpdate: 0,
+    box: null,
+    mouse: { x: -400, y: -400 },
+  })
+  const physRef = useRef({ particles: null, springs: null, accumulator: 0, prevTime: null, rigidBody: null })
+
+  useEffect(() => {
+    window.sandStats = () => {
+      const grains = physRef.current?.sandParticles
+      if (!grains?.length) { console.log('no sand'); return }
+      const speeds = grains.map(g => Math.hypot(g.vx, g.vy))
+      speeds.sort((a, b) => a - b)
+      const mean = speeds.reduce((s, v) => s + v, 0) / speeds.length
+      const buckets = [0,1,2,5,10,20,50,Infinity]
+      const hist = {}
+      for (let i = 0; i < buckets.length - 1; i++) {
+        const lo = buckets[i], hi = buckets[i+1]
+        hist[`${lo}–${hi === Infinity ? '∞' : hi}`] = speeds.filter(s => s >= lo && s < hi).length
+      }
+      console.table({ mean: mean.toFixed(2), median: speeds[speeds.length>>1].toFixed(2), p95: speeds[Math.floor(speeds.length*0.95)].toFixed(2), max: speeds[speeds.length-1].toFixed(2) })
+      console.table(hist)
+    }
+    return () => { delete window.sandStats }
+  }, [])
+  const glassVisualTypesRef = useRef(null)   // per-particle display color, assigned at init
+  const presetIdRef  = useRef(presetId)
+  // Mirrors of the two ramp modes, for the tab-switch staleness check (which runs
+  // in an effect and must not re-fire on every mode change).
+  const coolingModeRef   = useRef(null)
+  const meltHeatModeRef  = useRef(null)
+  const hcPlateauRef = useRef(4)
+  const glassDkRef   = useRef(darkMode)
+
+  // ── Shared temperature — single source of truth for both Glass and Melt tabs ──
+  // Energy integration lives here (top-level RAF), not inside the Glass canvas loop.
+  // Both tabs read sharedTempRef.current.temp; each drives its own physics from it.
+  const sharedTempRef = useRef({ temp: 25, lastTs: 0, cumulativeEnergy: 0 })
+
+  // Melt tab has its own independent temperature driven by its own energy input
+  const meltTempRef             = useRef({ temp: 0, lastTs: 0, cumulativeEnergy: 0 })  // page-load start temp; matches meltLocalTemp so heating doesn't snap the graph down
+  const gotoTargetRef           = useRef(null)   // GO target temp; integrator ramps to it then stops
+  const [gotoTargetTemp, setGotoTargetTemp] = useState(null)   // shown as a dotted line on the graph
+  const meltCumulativeEnergyRef = useRef(0)  // raw energy accumulated (x-axis for T-E graph)
+  const meltSimRef  = useRef({
+    energyInput: 0,
+    baseRate: 200,
+  })
+
+  useEffect(() => { boxSimRef.current.boxState = boxState }, [boxState])
+  useEffect(() => { boxSimRef.current.sandDevMode = sandDevMode }, [sandDevMode])
+  useEffect(() => { boxSimRef.current.showMiniView = showMiniView }, [showMiniView])
+  useEffect(() => { tabRef.current = tab }, [tab])
+  // Quality tier → renderer DPR cap. Switching tiers must NOT rebuild the Bulk sim: everything
+  // tier-dependent (glow blurs, physics time budget, DPR) is read live each frame, so the current
+  // melt state carries straight over. The one thing baked in at init is the grain count
+  // (sandGrainScale, 1 on every tier today) — rebuild only if that actually changes.
+  const appliedGrainScaleRef = useRef(caps.sandGrainScale ?? 1)
+  useEffect(() => {
+    capsRef.current = caps
+    setMaxDpr(caps.maxDpr)
+    const phys = physRef.current
+    const gs = caps.sandGrainScale ?? 1
+    if (phys && gs !== appliedGrainScaleRef.current) {
+      appliedGrainScaleRef.current = gs
+      phys.sandParticles = null
+      phys.particles     = null
+      phys.springs       = null
+      phys.rigidBody     = null
+      phys.naBlobs       = []
+      phys.blobMct       = {}
+      phys.accumulator   = 0
+      phys.prevTime      = null
+    }
+  }, [caps])
+  useEffect(() => { coolingModeRef.current  = coolingMode  }, [coolingMode])
+  useEffect(() => { meltHeatModeRef.current = meltHeatMode }, [meltHeatMode])
+
+  // ── Tab switch: freeze the old tab, validate-or-rebuild the new one ───────
+  // Conditions that make a frozen simulation state stale. Temperature is the big
+  // one — any heating, cooling or GO ramp moves it, and a frozen melt that was
+  // settled at 800 °C is simply wrong once the shared temperature reads 1500 °C.
+  // Rounded to 1 °C so thermostat jitter alone doesn't trigger a rebuild.
+  //
+  // NOTE: dev-panel physics sliders are NOT tracked here. They mutate shared module
+  // state in meltPhysics.js and would need 29 more dependencies; dev-only, so the
+  // frozen state can be slightly stale after a slider move. Switch tabs twice, or
+  // change the temperature, to force a rebuild.
+  const currentCond = useCallback(() => ({
+    temp:    Math.round(meltTempRef.current.temp),
+    preset:  presetIdRef.current,
+    cooling: coolingModeRef.current,
+    heat:    meltHeatModeRef.current,
+  }), [])
+
+  // Regenerate the Bulk candidate states (melted snapshots at benchmark temps). Time-boxed
+  // across frames with a progress bar so it never freezes the tab. In-memory (too large for
+  // localStorage); rerun this after tweaking the melt physics.
+  const regenCandidates = useCallback(() => {
+    if (genProgress !== null) return
+    const pr = PRESETS.find(x => x.id === presetIdRef.current) ?? PRESETS[0]
+    const HS = BOX_SIZE / 2
+    const grains = Math.round((pr.nGrains ?? 1800) * (capsRef.current.sandGrainScale ?? 1))
+    const G = makeBulkGenState(HS, pr.na2o, grains, boxSimRef.current.multiRadius)
+    setGenProgress(0)
+    const tick = () => {
+      const p = stepBulkGen(G, 60)
+      if (G.done) { bulkCandidatesRef.current = G.out; setGenProgress(null) }
+      else { setGenProgress(p); requestAnimationFrame(tick) }
+    }
+    requestAnimationFrame(tick)
+  }, [genProgress])
+
+  const prevTabRef = useRef('melt')
+  useEffect(() => {
+    const prev = prevTabRef.current
+    if (prev === tab) return
+    prevTabRef.current = tab
+    const frozen = frozenCondRef.current
+
+    // The tab we just left is now frozen — remember what it was valid for.
+    frozen[prev] = currentCond()
+
+    // The tab we just entered: reuse its frozen state only if nothing it depends
+    // on has moved since. Otherwise rebuild from a fresh start state.
+    const was = frozen[tab]
+    const now = currentCond()
+    const stale = !was || was.temp !== now.temp || was.preset !== now.preset ||
+                  was.cooling !== now.cooling || was.heat !== now.heat
+    frozen[tab] = null
+
+    // The melt (Particles) tab ALWAYS resumes from its exact frozen physics — it is
+    // never rebuilt on a tab switch, so the precise particle state we left is restored
+    // byte-for-byte on return. A composition/preset change rebuilds it anyway through
+    // the `cellData` dependency of CompositionView's init effect; a temperature or
+    // ramp-mode change is simply applied by the thermostat when stepping resumes.
+    // Only the Bulk box sim — which is cheap and keeps no persistent structure worth
+    // preserving — is rebuilt when its frozen state is stale.
+    if (tab === 'glass' && stale) {
+      // Null the box sim's state; frame()'s lazy init rebuilds it for the current
+      // preset and boxState on the next tick.
+      const phys = physRef.current
+      if (phys) {
+        phys.sandParticles = null
+        phys.particles     = null
+        phys.springs       = null
+        phys.rigidBody     = null
+        phys.naBlobs       = []
+        phys.blobMct       = {}
+        phys.accumulator   = 0
+        phys.prevTime      = null
+      }
+      // Heating happened on the (frozen) Particles tab, so the freshly-rebuilt sand
+      // Catch-up for the freshly-rebuilt cold sand. If candidate states exist, restore the
+      // nearest precomputed snapshot instantly (frame() picks it up). Otherwise fall back to
+      // the heat-up replay that melts from cold behind the loading overlay.
+      const s = boxSimRef.current
+      s.heatReplay = null
+      s.heatReplayPending = false
+      s.restoreTemp = null
+      if (bulkCandidatesRef.current.length && now.temp > 30) {
+        s.restoreTemp = now.temp           // instant: load nearest candidate at/below this temp
+      } else {
+        s.heatReplayPending = now.temp > 30
+      }
+    }
+
+    // Particles tab: CompositionView detects a stale re-entry itself (first visible frame) and
+    // catches up via its worker — see onCatchup below.
+  }, [tab, currentCond])
+
+  useEffect(() => {
+    document.body.style.background = darkMode ? '#080808' : '#e8e3da'
+    document.body.setAttribute('data-theme', darkMode ? 'dark' : 'light')
+    glassDkRef.current = darkMode
+    return () => document.body.removeAttribute('data-theme')
+  }, [darkMode])
+
+  // Load the bundled candidate states for the active preset (instant catch-up, no generation).
+  useEffect(() => { bulkCandidatesRef.current = BULK_CANDIDATES[presetId] ?? [] }, [presetId])
+
+
+  // dev mode: type "dev" to toggle
+  useEffect(() => {
+    let buf = ''
+    const handler = e => {
+      if (e.target.tagName === 'TEXTAREA' || (e.target.tagName === 'INPUT' && e.target.type !== 'range')) return
+      buf = (buf + e.key.toLowerCase()).slice(-3)
+      if (buf === 'dev') { setShowDev(d => !d); setSandDevMode(d => !d); buf = '' }
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [])
+
+  useEffect(() => {
+    let raf
+    function integrateTick(ts) {
+      const s = boxSimRef.current
+      const st = sharedTempRef.current
+      st.lastTs = ts
+      // Glass blob always tracks melt temperature
+      st.temp = meltTempRef.current.temp
+      s.temp  = st.temp
+      raf = requestAnimationFrame(integrateTick)
+    }
+    raf = requestAnimationFrame(integrateTick)
+    return () => cancelAnimationFrame(raf)
+  }, [])
+
+  // ── Melt tab temperature integration ─────────────────────────────────────
+  useEffect(() => {
+    let raf
+    let tick = 0
+    function integrateMelt(ts) {
+      const s  = meltSimRef.current
+      const st = meltTempRef.current
+      const elapsed = st.lastTs ? Math.min((ts - st.lastTs) / 1000, 0.05) : 0
+      st.lastTs = ts
+      st.heatPower = 0  // heating power (°C·heat-capacity per wall-second) — read by CompositionView's heat lead
+      if (!boxSimRef.current.sandPaused && !timeStoppedRef.current && s.energyInput !== 0 && elapsed > 0) {
+        const input      = s.energyInput
+        const atFloor    = st.temp <= 0    && input < 0
+        const atCeiling  = st.temp >= 1800 && input > 0
+        if (atCeiling || atFloor) {
+          // Reached the limit: snap to exactly 1800 / 0, stop adding energy, and clear the heat
+          // mode so the Bulk border glow turns off (energy input is now zero).
+          st.temp = atCeiling ? 1800 : 0
+          s.energyInput = 0; gotoTargetRef.current = null
+          setMeltLocalTemp(st.temp); setMeltHeatMode(null)
+        } else {
+          const rawDelta = (input / 100) * s.baseRate * elapsed
+          meltCumulativeEnergyRef.current += rawDelta
+          const pr       = PRESETS.find(x => x.id === presetIdRef.current) ?? PRESETS[0]
+          const hcFactor = meltHeatCapacity(st.temp, pr.na2o, hcPlateauRef.current)
+          st.temp = Math.max(0, Math.min(1800, st.temp + rawDelta / hcFactor))
+          if (input > 0) st.heatPower = (input / 100) * s.baseRate
+          // GO ramp: stop when the target is reached.
+          const gt = gotoTargetRef.current
+          if (gt != null && ((input > 0 && st.temp >= gt) || (input < 0 && st.temp <= gt))) {
+            st.temp = gt; s.energyInput = 0; gotoTargetRef.current = null; setMeltLocalTemp(gt)   // keep the dotted target line visible after arrival
+          } else if (++tick % 6 === 0) setMeltLocalTemp(Math.round(st.temp))
+        }
+      }
+      raf = requestAnimationFrame(integrateMelt)
+    }
+    raf = requestAnimationFrame(integrateMelt)
+    return () => cancelAnimationFrame(raf)
+  }, [])
+
+  // ── Replay / time ─────────────────────────────────────────────────────────
+  const timeStopped = timePaused || replayFrame !== null || particlesLoading
+  const replayFrameInfo = replayFrame !== null ? replayInfoRef.current[replayFrame] : null
+  const shownTemp = replayFrameInfo ? replayFrameInfo.t : meltLocalTemp   // LCDs follow the scrubbed moment
+  timeStoppedRef.current = timeStopped
+  // CompositionView reports the history length (throttled); a reset reports 0.
+  const handleReplayReady = useCallback(count => {
+    setReplayFrameCount(count)
+    if (count === 0) { setReplayFrame(null); setReplayPlaying(false) }
+  }, [])
+  // Turtle / rabbit: play history from the scrub position (or from the start when LIVE) at slow /
+  // fast speed; pressing the active one again stops; reaching the end returns to LIVE.
+  const playReplay = useCallback(speed => {
+    if (replayPlaying === speed) { setReplayPlaying(false); return }
+    if (replayFrame === null || replayFrame >= replayFrameCount - 1) setReplayFrame(0)
+    setReplayPlaying(speed)
+  }, [replayPlaying, replayFrame, replayFrameCount])
+  const handleTempUpdate   = useCallback(v => { setMeltLocalTemp(v); meltTempRef.current.temp = v }, [])
+  // New run (first Heat / Go-to of a trip, or the first Cool) → the bond counts right now become the
+  // reference the "Change" row measures from.
+  // Also starts a fresh replay history: the turtle/rabbit replay and the scrub bar cover the current
+  // run from its button press (heat, then cool), not the idle time since page load / Reset.
+  const markBondRun = useCallback(phase => {
+    if (bondPhaseRef.current === phase) return
+    bondPhaseRef.current = phase
+    if (bondCountsRef.current) setBondRef({ phase, counts: bondCountsRef.current })
+    setReplayFrame(null); setReplayPlaying(false)   // back to LIVE before the history is replaced
+    setHistoryRun(n => n + 1); setHistoryGap(false)
+  }, [])
+  const onGoTemp = useCallback(() => {
+    const v = Math.max(0, Math.min(1800, Math.round(+gotoTemp)))
+    if (!Number.isFinite(v)) return
+    if (coolLockedRef.current) return   // a committed cool run owns the temperature until reset
+    markBondRun('heat')
+    setMeltHeatMode(null); setCoolingMode(null)
+    // Ramp to the target via the heat-capacity integrator (same rate as Fast Heat / cool).
+    gotoTargetRef.current = v; setGotoTargetTemp(v)
+    meltSimRef.current.energyInput = v > meltTempRef.current.temp ? 100 : v < meltTempRef.current.temp ? -100 : 0
+  }, [gotoTemp, markBondRun])
+  const handleEnergyUpdate = useCallback((_ke, _pe, t, e, fb, mas, sfr, met, mxs) => {
+    setDerivedTemp(t)
+    if (e   !== undefined) setTargetE(e)
+    if (fb  !== undefined) setFBroken(fb)
+    if (sfr !== undefined) setSevFireRate(sfr)
+    if (met !== undefined) setMeanEffThreshold(met)
+    const now = Date.now()
+    if (now - strainUpdateTimeRef.current >= 500) {
+      strainUpdateTimeRef.current = now
+      if (mas !== undefined) setMeanAvgStrain(mas)
+      if (mxs !== undefined) setMaxAvgStrain(mxs)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!replayPlaying) { cancelAnimationFrame(replayRafRef.current); return }
+    const fps = replayPlaying === 'fast' ? (window._replayFastFps ?? 45) : (window._replaySlowFps ?? 10)
+    let last = null, acc = 0
+    const tick = ts => {
+      const dt = last === null ? 0 : Math.min(0.1, (ts - last) / 1000)
+      last = ts
+      acc += dt * fps
+      const adv = Math.floor(acc); acc -= adv
+      if (adv > 0) setReplayFrame(f => {
+        const next = (f ?? 0) + adv
+        if (next >= replayFrameCount - 1) { setReplayPlaying(false); return null }   // end → LIVE
+        return next
+      })
+      replayRafRef.current = requestAnimationFrame(tick)
+    }
+    replayRafRef.current = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(replayRafRef.current)
+  }, [replayPlaying, replayFrameCount])
+  // Leaving the Particles tab returns to LIVE (history is a Particles-view feature).
+  useEffect(() => { if (tab !== 'melt') { setReplayPlaying(false); setReplayFrame(null) } }, [tab])
+
+  const startCooling = useCallback(mode => {
+    if (coolLockedRef.current) return   // one press per run: no pause, no switching speed
+    markBondRun('cool')
+    coolLockedRef.current = mode; setCoolLocked(mode)
+    heatLockedRef.current = true; setHeatLocked(true)   // cooling is one-way: heat stays off until reset
+    setReplayFrame(null); setReplayPlaying(false)   // back to LIVE (history keeps recording)
+    setMeltHeatMode(null)
+    window.resetLifetimes?.()
+    // CompositionView's energy ramp is the sole temperature driver; onTempUpdate syncs the LCD.
+    meltSimRef.current.energyInput = 0
+    setCoolingMode(mode)
+  }, [markBondRun])
+
+  const toggleMeltHeat = useCallback(mode => {
+    if (heatLockedRef.current) return   // one press per trip: no pause, no switching speed
+    heatLockedRef.current = true; setHeatLocked(true)
+    markBondRun('heat')
+    setCoolingMode(null)
+    window.resetLifetimes?.()
+    meltSimRef.current.energyInput = mode === 'fast' ? 100 : 50
+    setMeltHeatMode(mode)
+  }, [markBondRun])
+
+  const handleBondCounts = useCallback(counts => {
+    setBondCounts(counts)
+    bondCountsRef.current = counts
+    if (!initialBondCapturedRef.current && counts) {
+      setInitialBondCounts(counts)
+      initialBondCapturedRef.current = true
+    }
+  }, [])
+
+
+  // ── Glass / box canvas loop — canvas always mounted so RAF never drops ────
+  useEffect(() => {
+    const canvas = boxCanvasRef.current
+    if (!canvas) return
+
+    // Fixed-size offscreens for sand (box-local coords, no resize needed)
+    const sandGlowOff  = document.createElement('canvas')
+    sandGlowOff.width  = BOX_SIZE; sandGlowOff.height = BOX_SIZE
+    const sandMeltOff   = document.createElement('canvas')
+    sandMeltOff.width   = BOX_SIZE; sandMeltOff.height = BOX_SIZE
+    const smctx         = sandMeltOff.getContext('2d')
+    const sandMeltCrisp = document.createElement('canvas')
+    sandMeltCrisp.width = BOX_SIZE; sandMeltCrisp.height = BOX_SIZE
+    const smctx2        = sandMeltCrisp.getContext('2d', { willReadFrequently: true })
+    // Metaball halo, pre-rendered ONCE: drawing this sprite per blob orb replaces a fresh
+    // createRadialGradient + arc fill per orb per frame (~1600 gradients/frame when hot).
+    const HALO_SPRITE_R = 32
+    const haloSprite = document.createElement('canvas')
+    haloSprite.width = haloSprite.height = HALO_SPRITE_R * 2
+    {
+      const hc = haloSprite.getContext('2d')
+      const grad = hc.createRadialGradient(HALO_SPRITE_R, HALO_SPRITE_R, 0, HALO_SPRITE_R, HALO_SPRITE_R, HALO_SPRITE_R)
+      grad.addColorStop(0,   'rgba(255,255,255,1.0)')
+      grad.addColorStop(0.3, 'rgba(220,220,220,0.65)')
+      grad.addColorStop(1,   'rgba(0,0,0,0)')
+      hc.fillStyle = grad
+      hc.beginPath(); hc.arc(HALO_SPRITE_R, HALO_SPRITE_R, HALO_SPRITE_R, 0, Math.PI * 2); hc.fill()
+    }
+    // Cooled-glass look: a CPU-readable copy of the soft halo field (the blob's "height") and the
+    // per-pixel glass output (see the glass pass after Pass 1B).
+    const glassFieldOff = document.createElement('canvas')
+    glassFieldOff.width = BOX_SIZE; glassFieldOff.height = BOX_SIZE
+    const gfctx         = glassFieldOff.getContext('2d', { willReadFrequently: true })
+    const glassOff      = document.createElement('canvas')
+    glassOff.width      = BOX_SIZE; glassOff.height = BOX_SIZE
+    const gctx          = glassOff.getContext('2d')
+    const glassImg      = gctx.createImageData(BOX_SIZE, BOX_SIZE)
+
+
+    // Full-canvas offscreens for floor-mode metaball (canvas-sized, resize with viewport)
+    const mFloorOff   = document.createElement('canvas')
+    const mFloorCrisp = document.createElement('canvas')
+    const sizeFloorCanvases = () => {
+      const w = canvas.clientWidth || 800, h = canvas.clientHeight || 600
+      if (mFloorOff.width !== w || mFloorOff.height !== h) {
+        mFloorOff.width = w;   mFloorOff.height = h
+        mFloorCrisp.width = w; mFloorCrisp.height = h
+      }
+    }
+    sizeFloorCanvases()
+
+    canvas.width  = canvas.clientWidth
+    canvas.height = canvas.clientHeight
+    const ro = new ResizeObserver(() => {
+      canvas.width  = canvas.clientWidth
+      canvas.height = canvas.clientHeight
+      sizeFloorCanvases()
+    })
+    ro.observe(canvas)
+
+    const worldPos = e => {
+      const r = canvas.getBoundingClientRect(), src = e.touches ? e.touches[0] : e
+      return { wx: src.clientX - r.left, wy: src.clientY - r.top }
+    }
+    const getDrawScale = () => Math.min(canvas.width, canvas.height) * 0.82 / BOX_SIZE
+    const cornersWorld = () => {
+      const s = boxSimRef.current
+      if (!s.box) return []
+      const bcx = canvas.width / 2, bcy = canvas.height / 2
+      const ds = getDrawScale()
+      const c = Math.cos(s.box.boxAngle), si = Math.sin(s.box.boxAngle), H = BOX_SIZE / 2 * ds
+      return [[-H,-H],[H,-H],[H,H],[-H,H]].map(([lx,ly]) => ({
+        wx: bcx + lx*c - ly*si, wy: bcy + lx*si + ly*c
+      }))
+    }
+
+    const onMouseMove = e => {
+      const { wx, wy } = worldPos(e)
+      const s = boxSimRef.current
+      s.mouse.x = wx; s.mouse.y = wy
+      if (s.box?.cornerDrag) {
+        const bcx = canvas.width / 2, bcy = canvas.height / 2
+        const mAngle = Math.atan2(wy - bcy, wx - bcx)
+        const newAngle = s.box.cornerDrag.startBoxAngle + (mAngle - s.box.cornerDrag.startMouseAngle)
+        s.box.boxAngularVel = newAngle - s.box.boxAngle
+        s.box.boxAngle = newAngle
+      }
+    }
+    const onDown = e => {
+      const { wx, wy } = worldPos(e)
+      const s = boxSimRef.current
+      s.mouse.x = wx; s.mouse.y = wy
+      {
+        const onCorner = cornersWorld().some(c => Math.hypot(c.wx - wx, c.wy - wy) < CORNER_R * getDrawScale())
+        if (onCorner && s.box) {
+          const bcx = canvas.width / 2, bcy = canvas.height / 2
+          s.box.cornerDrag = {
+            startMouseAngle: Math.atan2(wy - bcy, wx - bcx),
+            startBoxAngle:   s.box.boxAngle,
+          }
+        }
+      }
+    }
+    const onUp = () => {
+      const s = boxSimRef.current
+      if (s.box) s.box.cornerDrag = null
+    }
+
+    canvas.addEventListener('mousemove',  onMouseMove)
+    canvas.addEventListener('mousedown',  onDown)
+    canvas.addEventListener('mouseup',    onUp)
+    canvas.addEventListener('mouseleave', onUp)
+    canvas.addEventListener('touchstart', onDown,      { passive: true })
+    canvas.addEventListener('touchmove',  onMouseMove, { passive: true })
+    canvas.addEventListener('touchend',   onUp)
+
+    const ctx = canvas.getContext('2d')
+
+    // Two offscreen canvases: raw blobs → crisp binary mask via blur+contrast
+    const metaballOff = document.createElement('canvas')
+    metaballOff.width  = BOX_SIZE
+    metaballOff.height = BOX_SIZE
+    const mctx = metaballOff.getContext('2d')
+
+    const metaballCrisp = document.createElement('canvas')
+    metaballCrisp.width  = BOX_SIZE
+    metaballCrisp.height = BOX_SIZE
+    const mctx2 = metaballCrisp.getContext('2d')
+
+    // Separate mini offscreens for the blob-box preview (computed independently)
+    const miniOff   = document.createElement('canvas')
+    miniOff.width   = BOX_SIZE; miniOff.height = BOX_SIZE
+    const miniCrisp = document.createElement('canvas')
+    miniCrisp.width = BOX_SIZE; miniCrisp.height = BOX_SIZE
+    const mictx     = miniOff.getContext('2d')
+    const mictx2    = miniCrisp.getContext('2d', { willReadFrequently: true })
+
+    let raf
+
+    function frame(ts) {
+      const s    = boxSimRef.current
+      const phys = physRef.current
+      const _fc0 = performance.now()   // frame work time → adaptive quality
+
+      // Frame-to-frame elapsed, independent of the physics accumulator
+      const frameElapsed = s.lastFrameTs ? Math.min((ts - s.lastFrameTs) / 1000, 0.05) : 0
+      s.lastFrameTs = ts
+
+      // Keep s.temp in sync with shared temperature (energy integration runs in its own RAF)
+      s.temp = sharedTempRef.current.temp
+
+      // Sync display temp to React state (~20 fps throttle to avoid excessive re-renders)
+      if (ts - s.lastTempUpdate > 50) {
+        setGlassTemp(Math.round(s.temp))
+        s.lastTempUpdate = ts
+      }
+
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height)
+
+      // Only simulate and draw the bulk-material box while its tab is showing.
+      // On the melt tab this block used to keep stepping 1800-2250 sand grains
+      // through a 10-pass PBD solve and running two getImageData metaball passes
+      // for a canvas that was display:none — measured at ~35 ms/frame of pure
+      // waste. The state is left untouched so switching back resumes instantly
+      // (or rebuilds, if the tab-switch staleness check nulled it).
+      if (tabRef.current === 'glass') {
+        if (!s.box) s.box = { boxAngle: 0, boxAngularVel: 0, cornerDrag: null }
+        if (s.floorMode) {
+          // Returning from floor mode — reset to fresh particle state
+          phys.particles = null; phys.springs = null; phys.rigidBody = null
+          phys.prevTime = null;  phys.accumulator = 0; s.floorMode = false
+        }
+        const box = s.box
+        const HS  = BOX_SIZE / 2
+        const bcx = canvas.width / 2, bcy = canvas.height / 2
+
+        if (s.boxState === 'sand') {
+          // Instant candidate-state catch-up: restore the nearest precomputed melted snapshot
+          // at/below the current (peak) temperature, rather than melting from cold.
+          if (s.restoreTemp != null && bulkCandidatesRef.current.length) {
+            const cand = pickBulkCandidate(bulkCandidatesRef.current, s.restoreTemp)
+            const r = restoreSand(cand.snap)
+            phys.sandParticles = r.sandParticles
+            phys.naBlobs = r.naBlobs; phys.blobMct = r.blobMct
+            phys.meldCount = r.meldCount; phys.nNaOriginal = r.nNaOriginal; phys.nGrainOriginal = r.nGrainOriginal
+            phys.accumulator = 0; phys.prevTime = ts
+            s.temp = s.restoreTemp; s.restoreTemp = null
+            s.heatReplay = null; s.heatReplayPending = false
+          }
+          if (!phys.sandParticles) {
+            const pr = PRESETS.find(x => x.id === presetIdRef.current) ?? PRESETS[0]
+            // Grain count is scaled by the quality tier. stepSandPhysics' 10-pass PBD
+            // solve is ~34% of this tab's CPU at 4x throttle and is linear in grain
+            // count, so halving it on 'simple' is the main lever here.
+            const _grains = Math.round((pr.nGrains ?? 1800) * (capsRef.current.sandGrainScale ?? 1))
+            phys.sandParticles = initSandParticles(HS, s.multiRadius, pr.na2o, _grains)
+            phys.nNaOriginal = phys.sandParticles.filter(g => g.type === 'na').length
+            phys.nGrainOriginal = phys.sandParticles.length   // denominator for macroMeltFrac
+            phys.meldCount = 0
+            phys.naBlobs = []
+            phys.blobMct = {}
+            phys.accumulator = 0
+            phys.prevTime = ts
+          }
+        } else {
+          if (!phys.particles) {
+            phys.particles = initParticles()
+            phys.springs   = new Map()
+            phys.rigidBody = null
+            phys.accumulator = 0
+            phys.prevTime = ts
+            const pr = PRESETS.find(x => x.id === presetIdRef.current) ?? PRESETS[0]
+            glassVisualTypesRef.current = assignGlassTypes(phys.particles.length, pr.sio2, pr.na2o, pr.cao)
+          }
+        }
+
+        const elapsed = timeStoppedRef.current ? 0 : Math.min((ts - phys.prevTime) / 1000, 0.05)   // Pause stops time
+        phys.prevTime    = ts
+
+        if (!box.cornerDrag && !timeStoppedRef.current) {
+          if (s.autoRotate) {
+            box.boxAngle += 0.1 * 2 * Math.PI * elapsed
+          } else {
+            box.boxAngle      += box.boxAngularVel
+            box.boxAngularVel *= 0.94
+          }
+        }
+
+        bpStart(); if (window._bulkProf) _bp.frames++
+        if (s.boxState === 'sand') {
+          if (!phys.naBlobs) phys.naBlobs = []
+          if (!phys.blobMct) phys.blobMct = {}
+          // Secret heat-up catch-up: after heating on the frozen Particles tab, fast-forward
+          // a 25→current-temp ramp so the freshly-rebuilt cold sand arrives melted to the
+          // right degree. Runs instead of the live step until it reaches the target temp.
+          if (s.heatReplayPending && phys.sandParticles) {
+            s.heatReplayPending = false
+            const pr = PRESETS.find(x => x.id === presetIdRef.current) ?? PRESETS[0]
+            s.heatReplay = { t: 25, target: Math.max(25, sharedTempRef.current.temp),
+                             frame: 0, na2o: pr.na2o, plateau: hcPlateauRef.current }
+            for (let i = 0; i < 20; i++) stepSandPhysics(phys.sandParticles, FIXED_DT, HS, box.boxAngle, phys.naBlobs)
+          }
+          if (s.heatReplay) {
+            // Hide the catch-up melt behind a "Melting…" overlay and run it flat-out, then
+            // reveal the finished result. The first frame only turns the overlay ON (and skips
+            // the heavy compute) so it paints before we block the thread melting.
+            if (!boxLoadingRef.current) {
+              boxLoadingRef.current = true
+              setBoxLoading(true)
+            } else {
+              runHeatReplayChunk(phys, s, HS, box, presetIdRef.current === 'soda', true)
+              if (!s.heatReplay) { boxLoadingRef.current = false; setBoxLoading(false) }
+            }
+          } else if (!s.sandPaused && !timeStoppedRef.current) {
+            phys.accumulator += elapsed
+            // Physics TIME BUDGET per frame (per quality tier). Without it a slow machine spirals:
+            // a long frame demands more fixed steps, which makes the next frame longer, until the
+            // 0.05 s clamp (6 steps/frame) — bistable, measured 33 ↔ 50 ms frames at 4× throttle.
+            // Past the budget we drop the backlog: weak machines run mildly slow-motion but smooth.
+            const physBudget = capsRef.current.physBudgetMs ?? 12
+            const physT0 = performance.now()
+            while (phys.accumulator >= FIXED_DT) {
+              stepNaBlobSprings(phys.naBlobs, FIXED_DT, box.boxAngle, s.temp)
+              stepSandPhysics(phys.sandParticles, FIXED_DT, HS, box.boxAngle, phys.naBlobs)
+              checkNaBlobMerges(phys.naBlobs, phys.blobMct, phys.sandParticles, s.temp)
+              phys.accumulator -= FIXED_DT
+              if (window._bulkProf) _bp.steps++
+              if (performance.now() - physT0 > physBudget) { phys.accumulator = Math.min(phys.accumulator, FIXED_DT * 0.5); break }
+            }
+            bpMark('physics')
+            // Na₂O grain merging — only while the macro melt is BELOW the temperature's target,
+            // so it melts up to the matched degree and then holds (no creeping when paused).
+            if (macroMeltFrac(phys) < macroMeltTarget(s.temp)) {
+              meldSandFrame(phys, MELT_DRIVE_TEMP, presetIdRef.current === 'soda', 1, s.temp)
+            }
+            // Throttled stats for the dev panel (compare against particle fBroken to calibrate).
+            if (ts - lastMeltStatRef.current > 200) {
+              lastMeltStatRef.current = ts
+              setBoxMeltFrac(macroMeltFrac(phys))
+            }
+            bpMark('meld')
+          }
+        } else {
+          // Freeze/unfreeze transition
+          const frozen = s.temp <= T_RIGID
+          if (frozen && !phys.rigidBody) {
+            phys.rigidBody = freezeParticles(phys.particles)
+            phys.springs   = new Map()
+          } else if (!frozen && phys.rigidBody) {
+            syncParticlesToRigidBody(phys.particles, phys.rigidBody)
+            phys.rigidBody = null
+          }
+
+          phys.accumulator += elapsed
+          while (phys.accumulator >= FIXED_DT) {
+            if (phys.rigidBody) {
+              stepRigidBody(phys.rigidBody, FIXED_DT, HS, box.boxAngle)
+              syncParticlesToRigidBody(phys.particles, phys.rigidBody)
+            } else {
+              stepPhysics(phys.particles, phys.springs, FIXED_DT, HS, box.boxAngle, s.temp)
+            }
+            phys.accumulator -= FIXED_DT
+          }
+        }
+
+        // Visual scale: fill the available canvas with the box
+        const drawScale = getDrawScale()
+
+        // Active energy flow drives both the background wash and the border glow below. Only
+        // while energy is actually flowing: heating stops at the 1800 ceiling, cooling at the
+        // floor — at the limit the input is zero, so both return to neutral.
+        const _heat = (s.temp < 1799) ? meltHeatModeRef.current : null
+        const _cool = (s.temp > 35)   ? coolingModeRef.current  : null
+        // Background stays BLACK through heating and hot holds (gray looks bad behind raw grains);
+        // it fades to gray only while cooling, then holds gray (so the cooled glass is visible) and
+        // fades back to black if reheated. Latched ramp, not a temperature lookup.
+        {
+          const _gTarget = _cool ? 1 : (_heat ? 0 : bgGrayRef.current)
+          const _gRate   = window._glassBgFade ?? 0.03
+          bgGrayRef.current += (_gTarget - bgGrayRef.current) * _gRate
+        }
+        const _bgGray = bgGrayRef.current
+        glassGateRef.current += ((_cool ? 1 : (_heat ? 0 : (glassGateRef.current > 0.5 ? 1 : 0))) - glassGateRef.current) * 0.08
+        // Red/blue wash strength eases toward 1 while that flow is on and 0 once it stops, so when
+        // heating/cooling auto-shuts off (ceiling, ramp target, GO arrival, floor) the box fades
+        // back to neutral instead of cutting off. The refs hold LINEAR progress (constant step per
+        // frame); the wash strength is its smoothstep, so the fade starts gently, speeds through
+        // the middle and settles softly — no abrupt first drop. window._bgTintFade sets the pace
+        // (0.03 ≈ 100 frames end to end).
+        {
+          const _tStep = (window._bgTintFade ?? 0.03) / 3
+          const _toward = (cur, tgt) => cur + Math.sign(tgt - cur) * Math.min(_tStep, Math.abs(tgt - cur))
+          bgHeatTintRef.current = _toward(bgHeatTintRef.current, _heat ? 1 : 0)
+          bgCoolTintRef.current = _toward(bgCoolTintRef.current, _cool ? 1 : 0)
+        }
+        const _ease = u => u * u * (3 - 2 * u)
+        const _heatTint = _ease(bgHeatTintRef.current), _coolTint = _ease(bgCoolTintRef.current)
+
+        // Box clip (no pre-fill — background drawn behind blob after colorize)
+        ctx.save()
+        ctx.translate(bcx, bcy); ctx.rotate(box.boxAngle); ctx.scale(drawScale, drawScale)
+        ctx.beginPath(); ctx.rect(-HS, -HS, BOX_SIZE, BOX_SIZE); ctx.clip()
+
+        if (s.boxState === 'sand') {
+          // 0 at 300°C → gradual, ~0.17 at 500°C, ~0.58 at 1000°C, 1.0 at 1500°C
+          const heatT = Math.max(0, Math.min(1, (s.temp - 300) / 1200))
+          const hotR = 255, hotG = Math.round(80 * Math.pow(heatT, 2)), hotB = 0
+          const glowG = Math.round(140 * Math.pow(heatT, 2.5))
+
+          ctx.fillStyle = boxBgTint(22, 18, 16, _heatTint, _coolTint, _bgGray, s.temp)
+          ctx.fillRect(-HS, -HS, BOX_SIZE, BOX_SIZE)
+          bpMark('bg')
+
+          const _isSoda   = presetIdRef.current === 'soda'
+          // Na grains switch to metaball rendering at 700°C so they merge visually
+          const _naAsMeta = _isSoda && s.temp >= 700
+
+          // Heat glow pass — pure sand only. Decorative; dropped on 'simple' (a
+          // full-canvas blur up to 12 px plus a per-grain arc fill, every frame).
+          if (heatT > 0 && !_isSoda && capsRef.current.blobGlowBlur) {
+            const gc = sandGlowOff.getContext('2d')
+            gc.clearRect(0, 0, BOX_SIZE, BOX_SIZE)
+            gc.globalCompositeOperation = 'lighter'
+            gc.fillStyle = `rgba(255,${glowG},0,${heatT * heatT * 0.35})`
+            for (const g of phys.sandParticles) {
+              gc.beginPath()
+              gc.arc(g.x + HS, g.y + HS, g.r * 1.8, 0, Math.PI * 2)
+              gc.fill()
+            }
+          }
+
+          bpMark('sandGlow prep')
+          // Individual grain render — sand hexagons, plus Na circles when below melt temp.
+          // Batched: one path per colour (sand has ~12 colours + the Na colour) → one fill + one
+          // stroke per group, instead of a colour string, path, fill and stroke PER GRAIN
+          // (~3600 draw calls/frame). Same shapes, colours and outline as before.
+          ctx.lineWidth = 0.5
+          {
+            const groups = grainGroupsRef.current
+            groups.clear()
+            for (const g of phys.sandParticles) {
+              if (g.type === 'na-sub' || g.type === 'na-ctr') continue
+              if (_naAsMeta && g.type === 'na') continue
+              if (g.type === 'silicate') continue
+              const key = g.type === 'na' ? 'na:' + g.color : g.color
+              let arr = groups.get(key)
+              if (!arr) { arr = []; groups.set(key, arr) }
+              arr.push(g)
+            }
+            const blend = heatT > 0 ? heatT * heatT * 0.6 : 0
+            for (const [key, arr] of groups) {
+              const g0 = arr[0], isNa = g0.type === 'na'
+              ctx.fillStyle = blend > 0
+                ? `rgb(${Math.round(g0._cr + (hotR - g0._cr) * blend)},${Math.round(g0._cg + (hotG - g0._cg) * blend)},${Math.round(g0._cb + (hotB - g0._cb) * blend)})`
+                : g0.color
+              ctx.beginPath()
+              for (const g of arr) {
+                if (isNa) { ctx.moveTo(g.x + g.r, g.y); ctx.arc(g.x, g.y, g.r, 0, Math.PI * 2) }
+                else {
+                  // corner offsets cached per grain (recomputed only if its size/angle changes)
+                  let h = g._hex
+                  if (!h || g._hexR !== g.r || g._hexA !== g.angle) {
+                    h = g._hex = new Float32Array(12); g._hexR = g.r; g._hexA = g.angle
+                    for (let k = 0; k < 6; k++) { const a = g.angle + k * Math.PI / 3; h[k * 2] = g.r * Math.cos(a); h[k * 2 + 1] = g.r * Math.sin(a) }
+                  }
+                  ctx.moveTo(g.x + h[0], g.y + h[1])
+                  for (let k = 1; k < 6; k++) ctx.lineTo(g.x + h[k * 2], g.y + h[k * 2 + 1])
+                  ctx.closePath()
+                }
+              }
+              ctx.fill()
+              ctx.strokeStyle = isNa ? 'rgba(160,210,240,0.35)' : 'rgba(0,0,0,0.35)'
+              ctx.stroke()
+            }
+          }
+
+          bpMark('grains')
+          if (heatT > 0 && !_isSoda && capsRef.current.blobGlowBlur) {
+            ctx.filter = `blur(${Math.round(heatT * 12)}px)`
+            ctx.globalCompositeOperation = 'lighter'
+            ctx.drawImage(sandGlowOff, -HS, -HS, BOX_SIZE, BOX_SIZE)
+            ctx.filter = 'none'
+            ctx.globalCompositeOperation = 'source-over'
+          }
+
+          bpMark('sandGlow blur')
+          // Na and silicate grains: hard-edged solid circles, same gradual heat tint as sand
+          if (_naAsMeta) {
+            if (heatT > 0) {
+              const blend = heatT * heatT * 0.6
+              ctx.fillStyle = `rgb(${Math.round(220 + (hotR - 220) * blend)},${Math.round(238 + (hotG - 238) * blend)},${Math.round(248 * (1 - blend))})`
+            } else {
+              ctx.fillStyle = '#dceef8'
+            }
+            for (const g of phys.sandParticles) {
+              if (g.type !== 'na' && g.type !== 'silicate') continue
+              ctx.beginPath(); ctx.arc(g.x, g.y, g.r, 0, Math.PI * 2); ctx.fill()
+            }
+          }
+
+          bpMark('naCircles')
+          // Na₂O blobs — solid fill + separate transparent glow overlay (same as sand)
+          if (phys.naBlobs?.length) {
+            const t = Math.max(0, Math.min(1, (s.temp - 700) / 500))
+
+            // Pass 1A: sub-circle halos (additive) → crisp binary mask in smctx2
+            smctx.globalCompositeOperation = 'source-over'
+            smctx.clearRect(0, 0, BOX_SIZE, BOX_SIZE)
+            smctx.globalCompositeOperation = 'lighter'
+            for (const blob of phys.naBlobs) {
+              for (const p of blob.particles) {
+                if (p.type !== 'na-sub') continue
+                const br = p.r * 8
+                smctx.drawImage(haloSprite, p.x + HS - br, p.y + HS - br, br * 2, br * 2)
+              }
+            }
+            smctx.globalCompositeOperation = 'source-over'
+
+            bpMark('blob 1A halos')
+            // Pass 1B: contrast → near-binary mask, then hard-threshold alpha to true binary
+            // (no contrast(9999) filter any more: it only binarised RGB, and everything downstream —
+            // the source-in fill, the glow blur, the glass height — reads the mask's ALPHA only)
+            // Threshold alpha > 64 on the GPU via the SVG filter #gvAlphaThresh (no GPU→CPU readback
+            // — that readback was most of this pass). The first time, self-test it against the CPU
+            // threshold and fall back to the readback if the browser's result differs.
+            smctx2.clearRect(0, 0, BOX_SIZE, BOX_SIZE)
+            if (gpuThreshRef.current === true) {
+              smctx2.filter = 'url(#gvAlphaThresh)'
+              smctx2.drawImage(sandMeltOff, 0, 0)
+              smctx2.filter = 'none'
+            } else {
+              smctx2.drawImage(sandMeltOff, 0, 0)
+              const imgD = smctx2.getImageData(0, 0, BOX_SIZE, BOX_SIZE)
+              const px = imgD.data
+              for (let i = 3; i < px.length; i += 4) px[i] = px[i] > 64 ? 255 : 0
+              smctx2.putImageData(imgD, 0, 0)
+              if (gpuThreshRef.current === null) {   // one-time self-test of the GPU path
+                gpuThreshRef.current = false
+                try {
+                  const tc = document.createElement('canvas'); tc.width = tc.height = BOX_SIZE
+                  const tx = tc.getContext('2d', { willReadFrequently: true })
+                  tx.filter = 'url(#gvAlphaThresh)'; tx.drawImage(sandMeltOff, 0, 0); tx.filter = 'none'
+                  const A = tx.getImageData(0, 0, BOX_SIZE, BOX_SIZE).data
+                  let diff = 0, on = 0
+                  for (let i = 3; i < px.length; i += 4) { if ((A[i] > 127) !== (px[i] > 127)) diff++; if (px[i]) on++ }
+                  // too little blob to judge yet → leave untested (null) and retry on a later frame
+                  gpuThreshRef.current = on > 200 ? diff <= Math.max(4, on * 0.002) : null
+                  window._gpuThreshTest = { diff, on, ok: gpuThreshRef.current }
+                } catch { gpuThreshRef.current = false }
+              }
+            }
+
+            bpMark('blob 1B mask')
+            // ── Cooled glass (steps 1–3 of the glass look) ─────────────────────────────
+            // glassAmt crossfades the old self-lit fill → glass across the shared cooling band (1000 → 500 °C).
+            // The crisp blob mask, BLURRED by GL.gain px, is treated as the blob's HEIGHT (a pillow:
+            // 0.5 at the outline rising smoothly to 1 inside over the blur radius):
+            //  1. normal = from the height gradient (smooth + curved, works for merged/concave
+            //     blobs), rotated from the box frame into SCREEN space, so the light L (GL.lightDeg)
+            //     stays fixed while the box spins.
+            //  2. body = a faint green-gray veil (clear glass), not a dark fill.
+            //  3. rim = Fresnel (peaks at the outline) × light: bright pale edge facing L, a darker
+            //     refracted edge on the shadow side, a faint exit glow opposite the light.
+            //     Edge alpha comes from the soft height too → anti-aliased curved outline.
+            const GL = glassLookRef.current
+            const glassAmt = coolGreyFrac(s.temp) * glassGateRef.current   // cooling only; = share of particle bonds gone grey (shared COOL_BAND)
+            if (glassAmt > 0) {
+              gfctx.clearRect(0, 0, BOX_SIZE, BOX_SIZE)
+              gfctx.filter = `blur(${GL.gain}px)`
+              gfctx.drawImage(sandMeltCrisp, 0, 0)
+              gfctx.filter = 'none'
+              const F = gfctx.getImageData(0, 0, BOX_SIZE, BOX_SIZE).data
+              const O = glassImg.data, W = BOX_SIZE
+              const rimB = GL.rim, dark = GL.dark, gain = GL.gain * 11    // slope × blur width → tilt (≈4 at the outline)
+              // World-fixed light: per-pixel normals are in the BOX frame, so rotate them by the box
+              // angle into screen space before lighting — the lit edge stays toward the light while
+              // the box spins.
+              const lA = GL.lightDeg * Math.PI / 180, Lx = Math.cos(lA), Ly = Math.sin(lA)
+              const bc = Math.cos(box.boxAngle), bs = Math.sin(box.boxAngle)
+              const AMB = 0.12                            // unlit edges keep a little rim
+              const tr = 215, tg = 248, tb = 238          // lit rim: near-white, faint green-cyan
+              const ir = 70,  ig = 96,  ib = 92           // body veil: faint green-gray (clear glass)
+              // Body = the EXACT box background colour, painted opaque (hides any leftover grains under
+              // the glass), with the tint veil (GL.dark) over it — reads as perfectly clear glass.
+              const [bgR, bgG, bgB] = boxBgTintRGB(22, 18, 16, _heatTint, _coolTint, _bgGray, s.temp)
+              const vr = bgR + (ir - bgR) * dark, vg = bgG + (ig - bgG) * dark, vb = bgB + (ib - bgB) * dark
+              const er = 18,  eg = 30,  eb = 30           // shadow-side edge: dark, refracted look
+              O.fill(0)
+              for (let y = 1; y < W - 1; y++) {
+                for (let x = 1; x < W - 1; x++) {
+                  const i = y * W + x, f = F[i * 4 + 3] / 255
+                  if (f < 0.40) continue
+                  const ea = Math.min(1, (f - 0.40) / 0.08)          // thin anti-aliased edge
+                  const a  = ea * ea * (3 - 2 * ea)
+                  const gx = (F[(i + 1) * 4 + 3] - F[(i - 1) * 4 + 3]) / 510
+                  const gy = (F[(i + W) * 4 + 3] - F[(i - W) * 4 + 3]) / 510
+                  const k = i * 4
+                  // Flat interior (no slope → faces the viewer, no rim): plain body colour. Most
+                  // blob pixels take this path, skipping the lighting maths below.
+                  if (gx * gx + gy * gy < 1e-7) { O[k] = vr; O[k + 1] = vg; O[k + 2] = vb; O[k + 3] = 255 * a; continue }
+                  const gm = Math.sqrt(gx * gx + gy * gy), g = gm * gain
+                  const fres = _FRES_LUT[Math.min(_FRES_N - 1, (g * _FRES_SCALE) | 0)]   // Fresnel (1 − 1/√(1+g²))^2.2, tabulated
+                  // outward in-plane normal (height rises inward) → screen space → light term
+                  let ndl = 0
+                  if (gm > 1e-6) {
+                    const nx = -gx / gm, ny = -gy / gm
+                    ndl = (nx * bc - ny * bs) * Lx + (nx * bs + ny * bc) * Ly
+                  }
+                  const lit   = ndl > 0 ? _LIT_LUT[(ndl * 255) | 0] : 0       // ndl^1.3, tabulated
+                  const back  = ndl < 0 ? ndl * ndl : 0
+                  const bright = Math.min(1, fres * rimB * (AMB + (1 - AMB) * lit) + fres * 0.35 * back)  // lit rim + faint exit glow
+                  const shade  = Math.min(1, fres * (1 - lit) * 0.6)                                   // shadow-side edge
+                  let r = vr, gg = vg, b = vb
+                  r += (er - r) * shade; gg += (eg - gg) * shade; b += (eb - b) * shade
+                  r += (tr - r) * bright; gg += (tg - gg) * bright; b += (tb - b) * bright
+                  O[k] = r; O[k + 1] = gg; O[k + 2] = b
+                  O[k + 3] = 255 * a                                  // opaque body (bg colour + tint)
+                }
+              }
+              gctx.putImageData(glassImg, 0, 0)
+            }
+
+            bpMark('blob glass')
+            // Pass 1C: colorize mask with solid fill color → draw onto scene (fades out as glass fades in)
+            smctx.clearRect(0, 0, BOX_SIZE, BOX_SIZE)
+            smctx.drawImage(sandMeltCrisp, 0, 0)
+            smctx.save()
+            smctx.globalCompositeOperation = 'source-in'
+            smctx.fillStyle = blobFillColor(s.temp)
+            smctx.fillRect(0, 0, BOX_SIZE, BOX_SIZE)
+            smctx.restore()
+            // Opaque mask under the crossfade: two layers at 1−g and g leave g·(1−g) of whatever is
+            // underneath showing (25% at mid-fade, ~750 °C) — unabsorbed grains inside the melt
+            // showed through. Paint the melt's shape in the box background colour at full alpha first,
+            // so what shows through is plain background (same look, no grains).
+            if (glassAmt > 0 && glassAmt < 1) {
+              const [cr, cg, cb] = boxBgTintRGB(22, 18, 16, _heatTint, _coolTint, _bgGray, s.temp)
+              gfctx.clearRect(0, 0, BOX_SIZE, BOX_SIZE)
+              gfctx.drawImage(sandMeltCrisp, 0, 0)
+              gfctx.globalCompositeOperation = 'source-in'
+              gfctx.fillStyle = `rgb(${cr | 0},${cg | 0},${cb | 0})`
+              gfctx.fillRect(0, 0, BOX_SIZE, BOX_SIZE)
+              gfctx.globalCompositeOperation = 'source-over'
+              ctx.drawImage(gfctx.canvas, -HS, -HS, BOX_SIZE, BOX_SIZE)
+            }
+            if (glassAmt < 1) {
+              ctx.globalAlpha = 1 - glassAmt
+              ctx.drawImage(sandMeltOff, -HS, -HS, BOX_SIZE, BOX_SIZE)
+              ctx.globalAlpha = 1
+            }
+            if (glassAmt > 0) {
+              ctx.globalAlpha = glassAmt
+              ctx.drawImage(glassOff, -HS, -HS, BOX_SIZE, BOX_SIZE)
+              ctx.globalAlpha = 1
+            }
+
+            bpMark('blob 1C fill')
+            // Pass 2: soft glow overlay — blur the crisp mask, tint at low alpha, draw
+            // lighter. Decorative; dropped on 'simple'. The crisp metaball mask itself is
+            // kept, so the melt still reads as a blob.
+            if (capsRef.current.blobGlowBlur && glassAmt < 1) {
+              const glowBlur = Math.round(4 + 6 * t)
+              smctx.clearRect(0, 0, BOX_SIZE, BOX_SIZE)
+              smctx.filter = `blur(${glowBlur}px)`
+              smctx.drawImage(sandMeltCrisp, 0, 0)
+              smctx.filter = 'none'
+              smctx.save()
+              smctx.globalCompositeOperation = 'source-in'
+              smctx.fillStyle = blobGlowColor(s.temp)
+              smctx.fillRect(0, 0, BOX_SIZE, BOX_SIZE)
+              smctx.restore()
+              ctx.globalCompositeOperation = 'lighter'
+              ctx.globalAlpha = 1 - glassAmt
+              ctx.drawImage(sandMeltOff, -HS, -HS, BOX_SIZE, BOX_SIZE)
+              ctx.globalAlpha = 1
+              ctx.globalCompositeOperation = 'source-over'
+            }
+
+            bpMark('blob 2 glow')
+            // Pass 3: same heat glow as pure sand, using blob sub-circles as sources.
+            // Decorative; dropped on 'simple'.
+            if (heatT > 0 && capsRef.current.blobGlowBlur && glassAmt < 1) {
+              const gc = sandGlowOff.getContext('2d')
+              gc.clearRect(0, 0, BOX_SIZE, BOX_SIZE)
+              gc.globalCompositeOperation = 'lighter'
+              gc.fillStyle = `rgba(255,${glowG},0,${heatT * heatT * 0.35})`
+              for (const blob of phys.naBlobs) {
+                for (const p of blob.particles) {
+                  if (p.type !== 'na-sub') continue
+                  gc.beginPath()
+                  gc.arc(p.x + HS, p.y + HS, p.r * 1.8, 0, Math.PI * 2)
+                  gc.fill()
+                }
+              }
+              ctx.filter = `blur(${Math.round(heatT * 12)}px)`
+              ctx.globalCompositeOperation = 'lighter'
+              ctx.globalAlpha = 1 - glassAmt
+              ctx.drawImage(sandGlowOff, -HS, -HS, BOX_SIZE, BOX_SIZE)
+              ctx.globalAlpha = 1
+              ctx.filter = 'none'
+              ctx.globalCompositeOperation = 'source-over'
+            }
+
+            bpMark('blob 3 heatglow')
+            window._naBlobs = phys.naBlobs
+            window._bulkPhys = phys   // console diagnostics (grain census etc.)
+            window._blobMct = phys.blobMct
+          }
+        } else {
+          const t     = Math.max(0, Math.min(1, (s.temp - 25) / (1200 - 25)))
+          const blobR = PARTICLE_R * 5
+
+          // Step 1: raw gradient blobs on transparent offscreen (lighter = additive)
+          mctx.globalCompositeOperation = 'source-over'
+          mctx.clearRect(0, 0, BOX_SIZE, BOX_SIZE)
+          mctx.globalCompositeOperation = 'lighter'
+          for (const p of phys.particles) {
+            const px = p.x + HS, py = p.y + HS
+            const g  = mctx.createRadialGradient(px, py, 0, px, py, blobR)
+            g.addColorStop(0,    'rgba(255,255,255,1.0)')
+            g.addColorStop(0.35, 'rgba(200,200,200,0.50)')
+            g.addColorStop(1,    'rgba(0,0,0,0)')
+            mctx.fillStyle = g
+            mctx.beginPath(); mctx.arc(px, py, blobR, 0, Math.PI * 2); mctx.fill()
+          }
+          mctx.globalCompositeOperation = 'source-over'
+
+          // Step 2: blur+contrast → crisp binary blob on transparent bg
+          mctx2.clearRect(0, 0, BOX_SIZE, BOX_SIZE)
+          mctx2.filter = 'blur(4px) contrast(22)'
+          mctx2.drawImage(metaballOff, 0, 0)
+          mctx2.filter = 'none'
+
+          // Step 3: colorize blob in metaballOff (already consumed above).
+          // source-in paints glass color only where blob has alpha; outside stays transparent.
+          mctx.clearRect(0, 0, BOX_SIZE, BOX_SIZE)
+          mctx.drawImage(metaballCrisp, 0, 0)
+          mctx.save()
+          mctx.globalCompositeOperation = 'source-in'
+          mctx.fillStyle = glassColor(s.temp)
+          mctx.fillRect(0, 0, BOX_SIZE, BOX_SIZE)
+          mctx.restore()
+          mctx.globalCompositeOperation = 'source-over'
+
+          // Step 4: background — filled before the blob, never touches colorize. Neutral gray
+          // at rest, washed reddish while heating and bluish while cooling, back to gray cold.
+          ctx.fillStyle = boxBgTint(136, 136, 136, _heatTint, _coolTint, _bgGray, s.temp)
+          ctx.fillRect(-HS, -HS, BOX_SIZE, BOX_SIZE)
+
+          // Step 5: draw colored blob over gray with glow halo
+          ctx.save()
+          ctx.shadowColor = glassGlowColor(s.temp)
+          ctx.shadowBlur  = Math.round(4 + 26 * t)
+          ctx.drawImage(metaballOff, -HS, -HS, BOX_SIZE, BOX_SIZE)
+          ctx.restore()
+        }
+
+        ctx.restore()
+        bpMark('misc')
+
+        // Container border — colour + glow announces the active heat/cool RATE:
+        //   fast heat → hot glowing red; slow heat → dim red; fast cool → icy glowing blue;
+        //   slow cool → muted blue; idle → the subtle neutral border.
+        // Uses the same _heat/_cool flow computed above the box fill.
+        let _stroke = 'rgba(180,200,220,0.22)', _lw = 1.5, _glow = 0, _glowCol = 'transparent'
+        if (_cool === 'fast')      { _stroke = 'rgba(70,170,255,0.98)';  _lw = 3; _glow = 22; _glowCol = 'rgba(40,150,255,0.95)' }
+        else if (_cool === 'slow') { _stroke = 'rgba(120,160,205,0.60)'; _lw = 2; _glow = 5;  _glowCol = 'rgba(100,150,210,0.40)' }
+        else if (_heat === 'fast') { _stroke = 'rgba(255,70,35,0.98)';   _lw = 3; _glow = 22; _glowCol = 'rgba(255,45,20,0.95)' }
+        else if (_heat === 'slow') { _stroke = 'rgba(220,105,80,0.60)';  _lw = 2; _glow = 5;  _glowCol = 'rgba(210,90,60,0.40)' }
+        ctx.save()
+        ctx.translate(bcx, bcy); ctx.rotate(box.boxAngle); ctx.scale(drawScale, drawScale)
+        ctx.strokeStyle = _stroke; ctx.lineWidth = _lw / drawScale
+        if (_glow > 0) { ctx.shadowBlur = _glow / drawScale; ctx.shadowColor = _glowCol }
+        ctx.strokeRect(-HS, -HS, BOX_SIZE, BOX_SIZE)
+        if (_glow > 0) { ctx.strokeRect(-HS, -HS, BOX_SIZE, BOX_SIZE); ctx.shadowBlur = 0 }  // 2nd pass = stronger glow
+        ctx.restore()
+        bpMark('border')
+
+        // Non-sand entity count — diagnostic HUD (dev mode only)
+        if (s.sandDevMode && s.boxState === 'sand' && phys.sandParticles) {
+          let nNa = 0, nSil = 0, nSub = 0, nSand = 0
+          for (const g of phys.sandParticles) {
+            if (g.type === 'na') nNa++
+            else if (g.type === 'silicate') nSil++
+            else if (g.type === 'na-sub') nSub++
+            else if (g.type === 'sand') nSand++
+          }
+          const nBlobs = phys.naBlobs?.length ?? 0
+          const lines = [
+            `sand:       ${nSand}`,
+            `free na:    ${nNa}`,
+            `silicate:   ${nSil}`,
+            `in blobs:   ${nSub}`,
+            `sil blobs:  ${nBlobs}`,
+          ]
+          ctx.save()
+          ctx.font = '11px monospace'
+          ctx.textAlign = 'left'
+          const x0 = bcx - BOX_SIZE * drawScale / 2
+          const y0 = bcy + BOX_SIZE * drawScale / 2 + 14
+          lines.forEach((ln, i) => {
+            ctx.fillStyle = 'rgba(0,0,0,0.55)'
+            ctx.fillText(ln, x0 + 1, y0 + i * 14 + 1)
+            ctx.fillStyle = i === 4 ? '#aaddff' : '#7a9080'
+            ctx.fillText(ln, x0, y0 + i * 14)
+          })
+          ctx.restore()
+        }
+
+      } else {
+        // Box is off — transition existing particles to floor mode, then run it
+
+        if (phys.particles && !s.floorMode) {
+          // Coming from box mode: unfreeze rigid body if needed, then transform
+          // particles from box-local coordinates to canvas world coordinates.
+          if (phys.rigidBody) {
+            syncParticlesToRigidBody(phys.particles, phys.rigidBody)
+            phys.rigidBody = null
+          }
+          const boxA = s.box ? s.box.boxAngle : 0
+          const cosA = Math.cos(boxA), sinA = Math.sin(boxA)
+          const bcx = canvas.width / 2, bcy = canvas.height / 2
+          for (const p of phys.particles) {
+            const wx  = bcx + p.x*cosA - p.y*sinA
+            const wy  = bcy + p.x*sinA + p.y*cosA
+            const wvx = p.vx*cosA - p.vy*sinA
+            const wvy = p.vx*sinA + p.vy*cosA
+            p.x = wx; p.y = wy; p.vx = wvx; p.vy = wvy; p.px = wx; p.py = wy
+          }
+          phys.springs = new Map()
+          phys.accumulator = 0
+          phys.prevTime = ts
+          s.floorMode = true
+          s.floorY = Math.round(canvas.height * 0.88)
+          sizeFloorCanvases()
+        }
+
+        if (s.floorMode && phys.particles) {
+          const elapsed = Math.min((ts - phys.prevTime) / 1000, 0.05)
+          phys.prevTime = ts
+
+          phys.accumulator += elapsed
+          while (phys.accumulator >= FIXED_DT) {
+            stepFloorPhysics(phys.particles, phys.springs, FIXED_DT, s.floorY, canvas.width, s.temp, null, null)
+            phys.accumulator -= FIXED_DT
+          }
+
+          // Black background — multiply colorize needs an opaque base or it tints transparent pixels
+          ctx.fillStyle = '#000'
+          ctx.fillRect(0, 0, canvas.width, canvas.height)
+
+          // Floor surface — same material as box walls
+          ctx.save()
+          ctx.fillStyle = '#0c0905'
+          ctx.fillRect(0, s.floorY, canvas.width, canvas.height - s.floorY)
+          ctx.beginPath(); ctx.moveTo(0, s.floorY); ctx.lineTo(canvas.width, s.floorY)
+          ctx.strokeStyle = 'rgba(200,170,120,0.85)'; ctx.lineWidth = 3; ctx.stroke()
+          ctx.restore()
+
+          // Glass blob — metaball
+            const t     = Math.max(0, Math.min(1, (s.temp - 25) / (1200 - 25)))
+            const blobR = PARTICLE_R * 5
+            const fctx  = mFloorOff.getContext('2d')
+            const fctx2 = mFloorCrisp.getContext('2d')
+            fctx.globalCompositeOperation = 'source-over'
+            fctx.clearRect(0, 0, mFloorOff.width, mFloorOff.height)
+            fctx.globalCompositeOperation = 'lighter'
+            for (const p of phys.particles) {
+              const g = fctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, blobR)
+              g.addColorStop(0,    'rgba(255,255,255,1.0)')
+              g.addColorStop(0.35, 'rgba(200,200,200,0.50)')
+              g.addColorStop(1,    'rgba(0,0,0,0)')
+              fctx.fillStyle = g
+              fctx.beginPath(); fctx.arc(p.x, p.y, blobR, 0, Math.PI * 2); fctx.fill()
+            }
+            fctx.globalCompositeOperation = 'source-over'
+            fctx2.clearRect(0, 0, mFloorCrisp.width, mFloorCrisp.height)
+            fctx2.filter = 'blur(4px) contrast(22)'
+            fctx2.drawImage(mFloorOff, 0, 0)
+            fctx2.filter = 'none'
+            ctx.save()
+            ctx.shadowColor = glassGlowColor(s.temp)
+            ctx.shadowBlur  = Math.round(4 + 26 * t)
+            ctx.drawImage(mFloorCrisp, 0, 0)
+            ctx.restore()
+            ctx.save()
+            ctx.globalCompositeOperation = 'multiply'
+            ctx.fillStyle = glassColor(s.temp)
+            ctx.fillRect(0, 0, canvas.width, canvas.height)
+            ctx.restore()
+
+        } else if (!phys.particles) {
+          s.floorMode = false
+        }
+      }
+
+      // ── Mini blob preview (blob-box) ──────────────────────────────
+      // DISABLED on the melt tab by the tab gate below, which in practice disables
+      // it entirely: the blob-box only renders in the header while showMiniView is
+      // on, and showing a live bulk-material thumbnail beside the particle view is
+      // exactly the "both at once" case we are eliminating — it ran its own
+      // contrast(9999) + getImageData(320x320) metaball pass every frame on top of
+      // the main one. Left intact behind the gate rather than deleted; it is a
+      // dev-panel checkbox that defaults off. If a macro thumbnail is wanted on the
+      // melt tab later, it needs to be a cached still, not a live second sim.
+      const mc = miniCanvasRef.current
+      if (mc && tabRef.current === 'glass' && s.showMiniView &&
+          (phys.particles?.length || phys.sandParticles?.length)) {
+        const dpr = effectiveDpr()
+        const mW  = mc.clientWidth, mH = mc.clientHeight
+        if (mW && mH) {
+          const cW = Math.round(mW * dpr), cH = Math.round(mH * dpr)
+          if (mc.width !== cW || mc.height !== cH) { mc.width = cW; mc.height = cH }
+          const mx       = mc.getContext('2d')
+          const HS       = BOX_SIZE / 2
+          const fitSize  = Math.min(cW, cH) * 0.574
+          const cx       = cW / 2, cy = cH / 2
+          const boxAngle = s.box?.boxAngle ?? 0
+
+          mx.clearRect(0, 0, cW, cH)
+          mx.fillStyle = '#111'
+          mx.fillRect(0, 0, cW, cH)
+
+          if (s.boxState === 'sand') {
+            const heatT  = Math.max(0, Math.min(1, (s.temp - 300) / 1200))
+            const hotR   = 255, hotG = Math.round(80 * Math.pow(heatT, 2))
+            const glowG  = Math.round(140 * Math.pow(heatT, 2.5))
+            const _isSoda   = presetIdRef.current === 'soda'
+            const _naAsMeta = _isSoda && s.temp >= 700
+            const scale  = fitSize / BOX_SIZE
+
+            // Background + sand grains
+            mx.save()
+            mx.translate(cx, cy); mx.rotate(boxAngle)
+            mx.fillStyle = '#161210'
+            mx.fillRect(-fitSize / 2, -fitSize / 2, fitSize, fitSize)
+            mx.lineWidth = 0.4
+            for (const g of phys.sandParticles) {
+              if (g.type === 'na-sub' || g.type === 'na-ctr') continue
+              if (heatT > 0) {
+                const blend = heatT * heatT * 0.6
+                mx.fillStyle = `rgb(${Math.round(g._cr + (hotR - g._cr) * blend)},${Math.round(g._cg + (hotG - g._cg) * blend)},${Math.round(g._cb * (1 - blend))})`
+              } else {
+                mx.fillStyle = g.color
+              }
+              const gr = Math.max(1.2, g.r * scale)
+              mx.beginPath()
+              if (g.type === 'na') {
+                mx.arc(g.x * scale, g.y * scale, gr, 0, Math.PI * 2)
+                mx.closePath(); mx.fill()
+                mx.strokeStyle = 'rgba(160,210,240,0.3)'; mx.stroke()
+              } else {
+                for (let k = 0; k < 6; k++) {
+                  const a = g.angle + k * Math.PI / 3
+                  const hx = g.x * scale + gr * Math.cos(a), hy = g.y * scale + gr * Math.sin(a)
+                  k === 0 ? mx.moveTo(hx, hy) : mx.lineTo(hx, hy)
+                }
+                mx.closePath(); mx.fill()
+                mx.strokeStyle = 'rgba(0,0,0,0.3)'; mx.stroke()
+              }
+            }
+            mx.restore()
+
+            // Sand heat glow — same two-pass approach as the main canvas
+            if (heatT > 0) {
+              mictx.clearRect(0, 0, BOX_SIZE, BOX_SIZE)
+              mictx.globalCompositeOperation = 'lighter'
+              mictx.fillStyle = `rgba(255,${glowG},0,${heatT * heatT * 0.28})`
+              for (const g of phys.sandParticles) {
+                if (g.type === 'na-sub' || g.type === 'na-ctr') continue
+                mictx.beginPath()
+                mictx.arc(g.x + HS, g.y + HS, g.r * 1.8, 0, Math.PI * 2)
+                mictx.fill()
+              }
+              mictx.globalCompositeOperation = 'source-over'
+              mx.save()
+              mx.translate(cx, cy); mx.rotate(boxAngle)
+              mx.filter = `blur(${Math.round(heatT * 10)}px)`
+              mx.globalCompositeOperation = 'lighter'
+              mx.drawImage(miniOff, -fitSize / 2, -fitSize / 2, fitSize, fitSize)
+              mx.filter = 'none'
+              mx.globalCompositeOperation = 'source-over'
+              mx.restore()
+            }
+
+            // Na₂O blobs — same metaball pipeline as the main view
+            if (phys.naBlobs?.length && s.temp >= 700) {
+              // Pass 1A: additive halos → miniOff
+              mictx.globalCompositeOperation = 'source-over'
+              mictx.clearRect(0, 0, BOX_SIZE, BOX_SIZE)
+              mictx.globalCompositeOperation = 'lighter'
+              for (const blob of phys.naBlobs) {
+                for (const p of blob.particles) {
+                  if (p.type !== 'na-sub') continue
+                  const px = p.x + HS, py = p.y + HS
+                  const br = p.r * 8
+                  const grad = mictx.createRadialGradient(px, py, 0, px, py, br)
+                  grad.addColorStop(0,   'rgba(255,255,255,1.0)')
+                  grad.addColorStop(0.3, 'rgba(220,220,220,0.65)')
+                  grad.addColorStop(1,   'rgba(0,0,0,0)')
+                  mictx.fillStyle = grad
+                  mictx.beginPath(); mictx.arc(px, py, br, 0, Math.PI * 2); mictx.fill()
+                }
+              }
+              mictx.globalCompositeOperation = 'source-over'
+
+              // Pass 1B: hard-threshold alpha to true binary mask
+              mictx2.clearRect(0, 0, BOX_SIZE, BOX_SIZE)
+              mictx2.filter = 'contrast(9999)'
+              mictx2.drawImage(miniOff, 0, 0)
+              mictx2.filter = 'none'
+              const imgD = mictx2.getImageData(0, 0, BOX_SIZE, BOX_SIZE)
+              const pxd  = imgD.data
+              for (let i = 3; i < pxd.length; i += 4) pxd[i] = pxd[i] > 64 ? 255 : 0
+              mictx2.putImageData(imgD, 0, 0)
+
+              // Pass 1C: colorize solid fill
+              mictx.clearRect(0, 0, BOX_SIZE, BOX_SIZE)
+              mictx.drawImage(miniCrisp, 0, 0)
+              mictx.save()
+              mictx.globalCompositeOperation = 'source-in'
+              mictx.fillStyle = blobFillColor(s.temp)
+              mictx.fillRect(0, 0, BOX_SIZE, BOX_SIZE)
+              mictx.restore()
+              mx.save()
+              mx.translate(cx, cy); mx.rotate(boxAngle)
+              mx.drawImage(miniOff, -fitSize / 2, -fitSize / 2, fitSize, fitSize)
+              mx.restore()
+
+              // Pass 2: glow overlay
+              {
+                const tBlob   = Math.max(0, Math.min(1, (s.temp - 700) / 500))
+                const glowBlur = Math.round(4 + 6 * tBlob)
+                mictx.clearRect(0, 0, BOX_SIZE, BOX_SIZE)
+                mictx.filter = `blur(${glowBlur}px)`
+                mictx.drawImage(miniCrisp, 0, 0)
+                mictx.filter = 'none'
+                mictx.save()
+                mictx.globalCompositeOperation = 'source-in'
+                mictx.fillStyle = blobGlowColor(s.temp)
+                mictx.fillRect(0, 0, BOX_SIZE, BOX_SIZE)
+                mictx.restore()
+                mx.save()
+                mx.translate(cx, cy); mx.rotate(boxAngle)
+                mx.globalCompositeOperation = 'lighter'
+                mx.drawImage(miniOff, -fitSize / 2, -fitSize / 2, fitSize, fitSize)
+                mx.globalCompositeOperation = 'source-over'
+                mx.restore()
+              }
+
+              // Pass 3: heat glow (same orange-red additive halo as sand)
+              if (heatT > 0) {
+                mictx.clearRect(0, 0, BOX_SIZE, BOX_SIZE)
+                mictx.globalCompositeOperation = 'lighter'
+                mictx.fillStyle = `rgba(255,${glowG},0,${heatT * heatT * 0.35})`
+                for (const blob of phys.naBlobs) {
+                  for (const p of blob.particles) {
+                    if (p.type !== 'na-sub') continue
+                    mictx.beginPath()
+                    mictx.arc(p.x + HS, p.y + HS, p.r * 1.8, 0, Math.PI * 2)
+                    mictx.fill()
+                  }
+                }
+                mictx.globalCompositeOperation = 'source-over'
+                mx.save()
+                mx.translate(cx, cy); mx.rotate(boxAngle)
+                mx.filter = `blur(${Math.round(heatT * 12)}px)`
+                mx.globalCompositeOperation = 'lighter'
+                mx.drawImage(miniOff, -fitSize / 2, -fitSize / 2, fitSize, fitSize)
+                mx.filter = 'none'
+                mx.globalCompositeOperation = 'source-over'
+                mx.restore()
+              }
+            }
+          } else {
+            const t     = Math.max(0, Math.min(1, (s.temp - 25) / (1200 - 25)))
+            const blobR = PARTICLE_R * 5
+
+            // Step 1: raw gradient blobs
+            mictx.globalCompositeOperation = 'source-over'
+            mictx.clearRect(0, 0, BOX_SIZE, BOX_SIZE)
+            mictx.globalCompositeOperation = 'lighter'
+            for (const p of phys.particles) {
+              const px = p.x + HS, py = p.y + HS
+              const g  = mictx.createRadialGradient(px, py, 0, px, py, blobR)
+              g.addColorStop(0,    'rgba(255,255,255,1.0)')
+              g.addColorStop(0.35, 'rgba(200,200,200,0.50)')
+              g.addColorStop(1,    'rgba(0,0,0,0)')
+              mictx.fillStyle = g
+              mictx.beginPath(); mictx.arc(px, py, blobR, 0, Math.PI * 2); mictx.fill()
+            }
+            mictx.globalCompositeOperation = 'source-over'
+
+            // Step 2: blur+contrast → crisp binary blob
+            mictx2.clearRect(0, 0, BOX_SIZE, BOX_SIZE)
+            mictx2.filter = 'blur(4px) contrast(22)'
+            mictx2.drawImage(miniOff, 0, 0)
+            mictx2.filter = 'none'
+
+            // Step 3: colorize blob in miniOff.
+            mictx.clearRect(0, 0, BOX_SIZE, BOX_SIZE)
+            mictx.drawImage(miniCrisp, 0, 0)
+            mictx.save()
+            mictx.globalCompositeOperation = 'source-in'
+            mictx.fillStyle = glassColor(s.temp)
+            mictx.fillRect(0, 0, BOX_SIZE, BOX_SIZE)
+            mictx.restore()
+            mictx.globalCompositeOperation = 'source-over'
+
+            // Step 4: gray inside box
+            mx.save()
+            mx.translate(cx, cy); mx.rotate(boxAngle)
+            mx.fillStyle = '#888888'
+            mx.fillRect(-fitSize / 2, -fitSize / 2, fitSize, fitSize)
+            mx.restore()
+
+            // Step 5: blob with glow
+            mx.save()
+            mx.translate(cx, cy); mx.rotate(boxAngle)
+            mx.shadowColor = glassGlowColor(s.temp)
+            mx.shadowBlur  = Math.round((4 + 26 * t) * fitSize / BOX_SIZE)
+            mx.drawImage(miniOff, -fitSize / 2, -fitSize / 2, fitSize, fitSize)
+            mx.restore()
+          }
+
+          // Box outline (both states)
+          mx.save()
+          mx.translate(cx, cy); mx.rotate(boxAngle)
+          mx.strokeStyle = 'rgba(180,200,220,0.30)'
+          mx.lineWidth   = 1.5
+          mx.strokeRect(-fitSize / 2, -fitSize / 2, fitSize, fitSize)
+          mx.restore()
+        }
+      }
+
+      // Adaptive quality sample: real Bulk frame work. Skipped while time is stopped (no physics →
+      // misleadingly cheap) and during the hidden heat-up catch-up (flat-out → misleadingly heavy).
+      if (tabRef.current === 'glass' && !timeStoppedRef.current && !s.heatReplay && !s.sandPaused)
+        recordFrameCost(performance.now() - _fc0)
+      raf = requestAnimationFrame(frame)
+    }
+
+    raf = requestAnimationFrame(frame)
+    return () => {
+      cancelAnimationFrame(raf)
+      canvas.removeEventListener('mousemove',  onMouseMove)
+      canvas.removeEventListener('mousedown',  onDown)
+      canvas.removeEventListener('mouseup',    onUp)
+      canvas.removeEventListener('mouseleave', onUp)
+      canvas.removeEventListener('touchstart', onDown)
+      canvas.removeEventListener('touchmove',  onMouseMove)
+      canvas.removeEventListener('touchend',   onUp)
+      ro.disconnect()
+    }
+  }, [])
+
+  const onAutoRotateChange = useCallback(e => {
+    const v = e.target.checked
+    setAutoRotate(v); boxSimRef.current.autoRotate = v
+  }, [])
+  const onEnergyInChange = useCallback(e => {
+    const v = +e.target.value
+    setGlassEnergyIn(v); boxSimRef.current.energyInput = v
+  }, [])
+  const onEnergyRelease = useCallback(() => {
+    setGlassEnergyIn(0); boxSimRef.current.energyInput = 0
+  }, [])
+  const onMeltEnergyChange  = useCallback(e => {
+    const v = +e.target.value
+    setMeltEnergyIn(v); meltSimRef.current.energyInput = v
+  }, [])
+  const onMeltEnergyRelease = useCallback(() => {
+    setMeltEnergyIn(0); meltSimRef.current.energyInput = 0
+  }, [])
+  const onZone1EndChange   = useCallback(e => { const v = +e.target.value; setZone1End(v);       boxSimRef.current.zone1End = v    }, [])
+  const onZone2EndChange   = useCallback(e => { const v = +e.target.value; setZone2End(v);       boxSimRef.current.zone2End = v    }, [])
+  const onZone1RateChange  = useCallback(e => { const v = +e.target.value; setZone1Rate(v);      boxSimRef.current.zone1Rate = v   }, [])
+  const onZone2RateChange  = useCallback(e => { const v = +e.target.value; setZone2Rate(v);      boxSimRef.current.zone2Rate = v   }, [])
+  const onZone3RateChange  = useCallback(e => { const v = +e.target.value; setZone3Rate(v);      boxSimRef.current.zone3Rate = v   }, [])
+  const onBaseRateChange   = useCallback(e => { const v = +e.target.value; setBaseEnergyRate(v); boxSimRef.current.baseRate = v    }, [])
+
+
+
+  const p            = PRESETS.find(x => x.id === presetId)
+  // Composition buttons are a HARD RESET: temperature, particle arrangement, rotation, the graph,
+  // particle/bond counts, replay, overlays and the background all return to the page-load state.
+  // Always bumps meltResetToken so even re-clicking the current preset fully rebuilds.
+  // Reset Hot is the same reset but starting at 1800 °C, fully melted: Particles takes the worker's
+  // stored state at the top of the Fast Heat track (the state the standard cools start from), Bulk the
+  // bundled 1800 °C snapshot. No run is in progress after either reset.
+  const MELT_START_TEMP = 0      // page-load / Reset Cold start temp — same for every preset (incl. Pure SiO₂)
+  const MELT_HOT_TEMP   = 1800   // Reset Hot start temp (the heating ceiling)
+  const switchPreset = (id, startTemp = MELT_START_TEMP) => {
+    setPresetId(id); presetIdRef.current = id
+    // modes / energy flow off
+    setCoolingMode(null); setMeltHeatMode(null)
+    heatLockedRef.current = false; setHeatLocked(false)   // new trip: heating available again
+    coolLockedRef.current = null;  setCoolLocked(null)    // …and either cool speed
+    meltSimRef.current.energyInput = 0
+    setMeltEnergyIn(0); setGlassEnergyIn(0)
+    gotoTargetRef.current = null; setGotoTargetTemp(null)
+    // temperature → start temp (every ref the heat integrator / box / graph read from)
+    meltTempRef.current.temp = startTemp
+    sharedTempRef.current.temp = startTemp
+    boxSimRef.current.temp = startTemp
+    meltCumulativeEnergyRef.current = 0
+    setMeltLocalTemp(startTemp); setDerivedTemp(startTemp)
+    // particle counts / bonds
+    setBondCounts(null); setInitialBondCounts(null); setBondRef(null); bondPhaseRef.current = null; setHistoryRun(0); setHistoryGap(false)
+    initialBondCapturedRef.current = false
+    bondCountsRef.current = null
+    // box particle arrangement → rebuild; rotation → home
+    glassVisualTypesRef.current = null
+    physRef.current.sandParticles = null
+    physRef.current.naBlobs = []
+    physRef.current.blobMct = {}
+    const box = boxSimRef.current.box
+    if (box) { box.boxAngle = 0; box.boxAngularVel = 0 }
+    // replay scrubber / overlays / macro-melt stat / candidate restore
+    setReplayFrame(null); setReplayFrameCount(0); setReplayPlaying(false)
+    setBoxLoading(false); setBoxMeltFrac(0); setParticlesLoading(false)
+    // Bulk start state: fresh cold sand, or (Reset Hot) the nearest bundled melt snapshot — frame()
+    // restores it the next time the Bulk tab draws
+    const bs = boxSimRef.current
+    bs.heatReplay = null
+    bs.restoreTemp = startTemp > 30 && (BULK_CANDIDATES[id] ?? []).length ? startTemp : null
+    bs.heatReplayPending = startTemp > 30 && !bs.restoreTemp
+    // background back to black (gray fade latch)
+    bgGrayRef.current = 0; bgHeatTintRef.current = 0; bgCoolTintRef.current = 0; glassGateRef.current = 0
+    // rebuild the melt-tab particle arrangement + clear the graph history (even on same preset)
+    setMeltResetToken(t => t + 1)
+  }
+
+  const lcdStyle = { position:'relative', background:'#909e77', border:'1px solid rgba(100,90,70,0.5)', borderRadius:3, fontFamily:'"DSEG7","Courier New",monospace', fontSize:15, letterSpacing:'0.05em', lineHeight:1, userSelect:'none', flexShrink:0 }
+  const dimTxt = { color: darkMode ? 'rgba(255,255,255,0.55)' : '#666', fontSize:11 }
+
+  return (
+    <div className="app">
+      {/* Alpha threshold for the Bulk metaball mask (alpha > 64/255 → 1), used as a canvas
+          filter so the mask needs no GPU→CPU readback. 4-step table: [0,.25)→0, [.25,1]→1. */}
+      <svg width="0" height="0" style={{ position:'absolute' }} aria-hidden="true">
+        <filter id="gvAlphaThresh" colorInterpolationFilters="sRGB">
+          <feComponentTransfer><feFuncA type="discrete" tableValues="0 1 1 1" /></feComponentTransfer>
+        </filter>
+      </svg>
+
+      {/* ── Top bar: steel control panel (v4 style) ── */}
+      <header className="top-bar">
+        <div className="toolbar">
+          {/* Corner bolts */}
+          <div className="panel-bolt" style={{ top:9,    left:9  }} />
+          <div className="panel-bolt" style={{ top:9,    right:9 }} />
+          <div className="panel-bolt" style={{ bottom:9, left:9  }} />
+          <div className="panel-bolt" style={{ bottom:9, right:9 }} />
+
+          {/* Top-right corner (beside the bolt, above the tab row): build marker + quality menu, and
+              the day/night toggle right-aligned under the menu. Always visible, never in the way. */}
+          <div style={{ position:'absolute', top:5, right:26, zIndex:1, display:'flex', flexDirection:'column', alignItems:'flex-end', gap:5 }}>
+            <span style={{
+              display:'flex', alignItems:'center', whiteSpace:'nowrap', pointerEvents:'none',
+              fontSize:9, fontWeight:700, letterSpacing:'0.04em', textTransform:'uppercase',
+              color:'rgba(90,90,90,0.85)',
+            }}>Field Test Version 109
+              {/* Quality: set by the startup speed test (bonds' benchmark), auto-adjusted at
+                  runtime; a manual pick becomes the ceiling. */}
+              <select value={quality} onChange={e => pickQuality(e.target.value)}
+                title={(() => { const st = detectPerformanceTier(); return `Speed test: gradient ${st.grad?.toFixed(1)} ms, trail ${st.trail?.toFixed(1)} ms → ${st.tier ?? 'n/a'}${st.low ? ' (very slow machine)' : ''}. Adjusts automatically; your pick is the ceiling.` })()}
+                style={{ pointerEvents:'auto', marginLeft:8, fontSize:10, fontWeight:700, letterSpacing:'0.04em',
+                  textTransform:'uppercase', fontFamily:'inherit', cursor:'pointer', padding:'1px 2px', borderRadius:3,
+                  background:'rgba(255,255,255,0.18)', color: detectPerformanceTier().low && quality === 'simple' ? 'rgba(170,40,30,0.9)' : 'rgba(70,70,70,0.9)',
+                  border: detectPerformanceTier().low && quality === 'simple' ? '1px solid rgba(190,60,50,0.55)' : '1px solid rgba(90,90,90,0.35)' }}>
+                {detectPerformanceTier().tier !== 'simple' && <option value="hires">Hi-res</option>}
+                <option value="detailed">Detailed</option>
+                <option value="simple">Simple</option>
+              </select>
+            </span>
+            <div style={{ display:'flex', alignItems:'center', gap:6 }}>
+              <span style={{fontSize:15, lineHeight:1, userSelect:'none', color:'#ffc020', display:'inline-block', width:18, textAlign:'center'}}>
+                {darkMode ? '☽' : '☀'}
+              </span>
+              <div onClick={() => setDarkMode(f => !f)} style={{
+                width:36, height:20, borderRadius:10, cursor:'pointer',
+                background: darkMode ? 'rgba(140,180,255,0.25)' : 'rgba(255,200,40,0.35)',
+                border:     darkMode ? '1px solid rgba(140,180,255,0.4)' : '1px solid rgba(200,150,20,0.45)',
+                position:'relative', transition:'background 0.2s, border-color 0.2s', flexShrink:0,
+              }}>
+                <div style={{
+                  width:14, height:14, borderRadius:7,
+                  background: darkMode ? '#a0c0ff' : '#ffc020',
+                  position:'absolute', top:2, left: darkMode ? 2 : 18,
+                  transition:'left 0.2s, background 0.2s',
+                  boxShadow: darkMode ? '0 0 6px rgba(160,200,255,0.9)' : '0 0 6px rgba(255,180,0,0.9)',
+                }} />
+              </div>
+            </div>
+          </div>
+
+          {/* Scrub slider — pinned at bottom of toolbar, melt tab only */}
+          {tab === 'melt' && (
+            <div style={{ position:'absolute', bottom:7, left:50, right:50, display:'flex', alignItems:'center', gap:6 }}>
+              {/* Stopwatch: marks the bar as the time scrubber; dims with it when there's no history */}
+              <img src="/glass/Stopwatch.png" draggable={false} alt="" title="Time scrubber — drag through the run's history"
+                style={{ height:30, flexShrink:0, filter:'brightness(0)', opacity: replayFrameCount < 2 || historyGap ? 0.25 : 0.6 }} />
+              <div style={{ flex:'0 1 90%', minWidth:0, display:'flex', alignItems:'center' }}>
+                {/* History scrubber (DVR): the whole recorded run; the right end is LIVE. Dragging left
+                    shows the past and stops time; dragging back to the end resumes LIVE. */}
+                <ScrubSlider
+                  value={replayFrameCount > 1 && replayFrame != null ? replayFrame / (replayFrameCount - 1) : 1}
+                  onChange={v => {
+                    if (replayFrameCount < 2 || historyGap) return
+                    setReplayPlaying(false)
+                    setReplayFrame(v >= 0.995 ? null : Math.round(v * (replayFrameCount - 1)))
+                  }}
+                  disabled={replayFrameCount < 2 || historyGap}
+                />
+              </div>
+            </div>
+          )}
+
+          {/* Action row */}
+          <div ref={toolbarRef} style={{ display:'flex', alignItems:'flex-start', gap:4, paddingLeft:6, paddingRight:6, marginBottom:-18 }}>   {/* −18: tuned so the toolbar's vertical centring puts the presets/tabs row at y 52 and the heat row at ~104 (each px here shifts the content ½ px) */}
+            {/* Left/center: two-row layout */}
+            <div style={{ flex:1, display:'flex', flexDirection:'column', gap:3, minWidth:0 }}>
+
+              {/* Row: tab-specific controls */}
+              <div style={{ display:'flex', alignItems:'center', gap:4, minWidth:0, flexWrap:'wrap' }}>
+                {/* Tab buttons — centered in the row (presets sit at the left via order:-1) */}
+                <div ref={tabGroupRef} style={{ display:'flex', gap:2, marginLeft:'auto', marginRight:'auto', position:'relative' }}>
+                  {/* Replay (turtle / rabbit) + pause hang under the split between the two tab buttons:
+                      anchored to the first tab's right edge (+1px = half the 2px gap) and dropped to the
+                      second toolbar line, then shifted left one button-step (60px = rabbit 54 + pause's
+                      6px margin) so PAUSE sits where the rabbit used to be. Absolute, so it never resizes
+                      either row, and the tab split never moves → nothing here moves between tabs. */}
+                  <span style={{ position:'relative', display:'inline-flex' }}>
+                    <button className={`tab-btn ${tab==='melt'?'active':''}`}  onClick={() => setTab('melt')}>Particles and Fields</button>
+                    <div style={{ position:'absolute', left:'calc(100% + 1px)', top:'calc(100% + 30px)', transform:'translateX(calc(-50% - 60px))', display:'flex', gap:4, zIndex:1 }}>
+                  {/* Pause — just RIGHT of the rabbit (turtle, rabbit, pause). Absolute, so turtle/rabbit stay
+                      centred on the tab split; and since that split never moves, neither does pause when
+                      switching tabs (turtle/rabbit are only hidden on Bulk, never removed). Shown on BOTH
+                      tabs: it stops time everywhere. */}
+                  <button className={`time-btn ${timePaused ? 'paused' : 'running'}`}
+                    style={{position:'absolute', left:'100%', marginLeft:6, top:0, bottom:0, width:58, padding:0, fontSize:13}}
+                    disabled={historyGap && !timePaused && tab === 'melt'}
+                    title={timePaused ? 'GO — resume time' : 'Pause — stop time'}
+                    onClick={() => setTimePaused(p => !p)}>{timePaused ? '▶ GO' : '❙ ❙'}</button>
+                  <button className={`action-btn replay-btn${replayPlaying === 'slow' ? ' active' : ''}`} style={{padding:'2px 9px', fontSize:11, flexShrink:0, display:'flex', alignItems:'center', justifyContent:'center', visibility: tab === 'melt' ? 'visible' : 'hidden'}}
+                    disabled={replayFrameCount < 2 || historyGap} title={historyGap ? 'No replay for this run — part of it happened on the Bulk tab' : 'Replay history slowly'}
+                    onClick={() => playReplay('slow')}
+                  ><img src="/glass/Turtle.png" draggable={false} style={{ height: '1.5em', filter: 'brightness(0) invert(1) brightness(0.7) sepia(1) hue-rotate(166deg) brightness(0.95)', marginRight: 3 }} /><span style={{ fontSize: '1.4em', color: '#90c8f0', lineHeight: 1 }}>↺</span></button>
+                  <button className={`action-btn replay-btn${replayPlaying === 'fast' ? ' active' : ''}`} style={{padding:'2px 9px', fontSize:11, flexShrink:0, display:'flex', alignItems:'center', justifyContent:'center', visibility: tab === 'melt' ? 'visible' : 'hidden'}}
+                    disabled={replayFrameCount < 2 || historyGap} title={historyGap ? 'No replay for this run — part of it happened on the Bulk tab' : 'Replay history fast'}
+                    onClick={() => playReplay('fast')}
+                  ><img src="/glass/Rabbit.png" draggable={false} style={{ height: '1.5em', filter: 'brightness(0) invert(1) brightness(0.7) sepia(1) hue-rotate(166deg) brightness(0.95)', marginRight: 3 }} /><span style={{ fontSize: '1.4em', color: '#90c8f0', lineHeight: 1 }}>↺</span></button>
+                    </div>
+                  </span>
+                  <button className={`tab-btn ${tab==='glass'?'active':''}`} onClick={() => setTab('glass')}>Bulk Material</button>
+                </div>
+
+                {/* Shared controls — identical position on both tabs: presets, tabs (above),
+                    heat/cool, GO box, kJ/°C readouts. Only the right "Visuals" group differs. */}
+                {<>
+                  {/* Presets — centered over the heat/cool cluster on the line below */}
+                  <div style={{ display:'flex', gap:3, order:-1, marginLeft:119, position:'relative' }}>
+                    {PRESETS.map(preset => (
+                      <button key={preset.id}
+                        className={`preset-btn ${presetId===preset.id?'active':''}`}
+                        onClick={() => switchPreset(preset.id)}
+                      >{preset.label}</button>
+                    ))}
+                    {/* Reset Cold / Hot — the same hard reset as picking a composition, for the current
+                        one. In the flow (not absolute) so the centred tab buttons account for them —
+                        absolute, the tabs could slide over them on narrower screens. Same on both
+                        tabs, so the tab positions still never shift when switching. */}
+                    <div style={{ marginLeft:5, display:'flex', gap:3 }}>
+                      <button className="preset-btn" style={{ whiteSpace:'nowrap' }}
+                        title="Reset to 0 °C: cold solid; particles, rotation and graph start over"
+                        onClick={() => switchPreset(presetIdRef.current, MELT_START_TEMP)}
+                      >Reset Cold</button>
+                      <button className="preset-btn" style={{ whiteSpace:'nowrap' }}
+                        title="Reset to 1800 °C: fully melted, ready to cool; rotation and graph start over"
+                        onClick={() => switchPreset(presetIdRef.current, MELT_HOT_TEMP)}
+                      >Reset Hot</button>
+                    </div>
+                  </div>
+                  {/* Second line: heat/cool buttons + readouts (flexBasis 100% forces a wrap) */}
+                  <div style={{ flexBasis:'100%', height:20 }} />
+                  {/* Heat/cool buttons, then the readouts right next to them */}
+                  <button className={`action-btn test-btn${meltHeatMode==='slow'?' active':''}`}
+                    disabled={heatLocked || meltLocalTemp >= 1800} title={heatLocked ? (coolLocked ? 'Cooling is one-way — press Reset Cold to heat again' : 'Heating can’t be paused or changed once started — press Reset Cold to start over') : meltLocalTemp >= 1800 ? 'Already at 1800°C' : undefined}
+                    style={{padding:'3px 9px', fontSize:11}} onClick={() => toggleMeltHeat('slow')}>Slow Heat</button>
+                  <button className={`action-btn test-btn${meltHeatMode==='fast'?' active':''}`}
+                    disabled={heatLocked || meltLocalTemp >= 1800} title={heatLocked ? (coolLocked ? 'Cooling is one-way — press Reset Cold to heat again' : 'Heating can’t be paused or changed once started — press Reset Cold to start over') : meltLocalTemp >= 1800 ? 'Already at 1800°C' : undefined}
+                    style={{padding:'3px 9px', fontSize:11}} onClick={() => toggleMeltHeat('fast')}>Fast Heat</button>
+                  {/* Cool: one press starts the run and greys both out (no pause, no speed switch);
+                      available once heating has finished and the melt is hot enough. */}
+                  {['slow', 'fast'].map(m => {
+                    const off = !!coolLocked || meltHeatMode !== null || meltLocalTemp < COOL_MIN_TEMP
+                    const why = coolLocked ? 'Cooling can’t be paused or changed once started — press Reset Hot to cool again'
+                              : meltHeatMode !== null ? 'Heating in progress — Cool is available once it reaches 1800°C'
+                                                      : `Heat to ${COOL_MIN_TEMP}°C first`
+                    return (
+                      <button key={m} className={`action-btn reset-btn${coolingMode===m?' active':''}`}
+                        disabled={off} title={off ? why : undefined}
+                        style={{padding:'3px 9px', fontSize:11}} onClick={() => startCooling(m)}
+                      >{m === 'slow' ? 'Slow Cool' : 'Fast Cool'}</button>
+                    )
+                  })}
+                  {showGoBox && <>
+                    <div className="toolbar-divider" />
+                    <input type="number" min={0} max={1800} value={gotoTemp}
+                      onChange={e => setGotoTemp(e.target.value)}
+                      onKeyDown={e => { if (e.key === 'Enter') onGoTemp() }}
+                      placeholder="°C"
+                      style={{ width:68, padding:'3px 5px', fontSize:12, textAlign:'right', border:'1px solid rgba(100,90,70,0.5)', borderRadius:3, background:'#e8e3da', color:'#2a2620' }} />
+                    <button className="action-btn test-btn" style={{padding:'3px 10px', fontSize:11}} onClick={onGoTemp}
+                      disabled={!!coolLocked || meltHeatMode !== null} title={coolLocked ? 'Cooling run in progress — press Reset Cold or Reset Hot' : meltHeatMode !== null ? 'Heating in progress' : undefined}>GO</button>
+                  </>}
+                  <div className="toolbar-divider" />
+                  {/* Readout labels sit ABOVE the LCDs (absolute — the toolbar height doesn't change) */}
+                  <div style={{ position:'relative' }}>
+                  <span style={{position:'absolute', bottom:'100%', left:0, right:0, marginBottom:2, textAlign:'center', whiteSpace:'nowrap', fontSize:13, fontWeight:700, letterSpacing:'0.08em', textTransform:'uppercase', color:QTY_COLORS.energy.light, pointerEvents:'none'}}>Energy</span>
+                  <div style={lcdStyle}>
+                    <span style={{visibility:'hidden', display:'block', padding:'3px 6px'}}>9999</span>
+                    <span style={{position:'absolute', inset:0, padding:'3px 6px', color:'rgba(60,60,60,0.15)', textAlign:'right'}}>8888</span>
+                    <span style={{position:'absolute', inset:0, padding:'3px 6px', color:'rgba(60,60,60,0.75)', textAlign:'right'}}>{Math.round(energyContentKJ(shownTemp, p.na2o, hcPlateau) * ENERGY_KJ_MULT)}</span>
+                  </div>
+                  </div>
+                  <span style={{fontSize:12, fontWeight:700, color:'rgba(30,45,60,0.70)'}}>kJ</span>
+                  <div style={{ position:'relative' }}>
+                  <span style={{position:'absolute', bottom:'100%', left:0, right:0, marginBottom:2, textAlign:'center', whiteSpace:'nowrap', fontSize:13, fontWeight:700, letterSpacing:'0.08em', textTransform:'uppercase', color:QTY_COLORS.temp.light, pointerEvents:'none'}}>Temp</span>
+                  <div style={lcdStyle}>
+                    <span style={{visibility:'hidden', display:'block', padding:'3px 6px'}}>1800</span>
+                    <span style={{position:'absolute', inset:0, padding:'3px 6px', color:'rgba(60,60,60,0.15)', textAlign:'right'}}>1800</span>
+                    <span style={{position:'absolute', inset:0, padding:'3px 6px', color:'rgba(60,60,60,0.75)', textAlign:'right'}}>{shownTemp}</span>
+                  </div>
+                  </div>
+                  <span style={{fontSize:12, fontWeight:700, color:'rgba(30,45,60,0.70)'}}>°C</span>
+                </>}
+
+                {/* Bulk-only dev controls — heat/cool, presets and readouts are shared above;
+                    Rotate lives in the right "Visuals" group. */}
+                {tab === 'glass' && presetId === 'soda' && sandDevMode && <>
+                    <div className="toolbar-divider" />
+                    <button className={`action-btn replay-btn${sandPaused?' active':''}`}
+                      style={{padding:'3px 9px', fontSize:11}}
+                      onClick={() => { const v=!sandPaused; setSandPaused(v); boxSimRef.current.sandPaused=v }}>
+                      {sandPaused ? 'Resume' : 'Pause'}
+                    </button>
+                    <button className="action-btn reset-btn"
+                      style={{padding:'3px 9px', fontSize:11}}
+                      onClick={() => {
+                        physRef.current.sandParticles = null
+                        physRef.current.naBlobs = []
+                        physRef.current.blobMct = {}
+                        physRef.current.meldCount = 0
+                        setSandPaused(false); boxSimRef.current.sandPaused = false
+                      }}>Reset</button>
+                </>}
+              </div>
+
+            </div>
+
+            {/* Far LEFT (order −1): visuals buttons. Fixed width (the 2×2 grid is the same size on
+                both tabs) so the column never reflows between tabs — the "Visuals" label and
+                (because the flex:1 column then stays put) the tab buttons stay in exactly the same
+                place when switching tabs. (Day/night lives top-right, under the quality menu.) */}
+            <div style={{flexShrink:0, width:170, order:-1, marginRight:12, display:'flex', flexDirection:'column', alignItems:'center', gap:3}}>
+              <span style={{fontSize:11, fontWeight:700, letterSpacing:'0.09em', textTransform:'uppercase', color:'rgba(30,45,60,0.65)'}}>Visuals</span>
+              {/* The grid ALWAYS renders two rows — on Bulk the empty cells are hidden placeholder
+                  buttons — so the header height is identical on both tabs. Positions stay stable:
+                     [ Count ] [ Charge ]   →Bulk  [ Graph ] [ Rotate ]   ← one row, centred vertically
+                     [ Graph ] [ Field  ]                                    on the 2-row block  */}
+              <div style={{display:'flex', alignItems:'center', gap:10}}>
+                <div style={{display:'grid', gridTemplateColumns:'repeat(2, 78px)', gap:3}}>
+                  {tab === 'glass' ? (<>
+                    {/* hidden placeholders hold the two-row height; Graph + Rotate span both rows, centred */}
+                    <button className="action-btn replay-btn" aria-hidden tabIndex={-1}
+                      style={{padding:'3px 0', width:'100%', visibility:'hidden', gridColumn:1, gridRow:1}}>Count</button>
+                    <button className="action-btn replay-btn" aria-hidden tabIndex={-1}
+                      style={{padding:'3px 0', width:'100%', visibility:'hidden', gridColumn:1, gridRow:2}}>Field</button>
+                    <button className={`action-btn replay-btn${showGraph?' active':''}`}
+                      style={{padding:'3px 0', width:'100%', gridColumn:1, gridRow:'1 / span 2', alignSelf:'center'}} onClick={() => setShowGraph(f => !f)}>Graph</button>
+                    <button className={`action-btn replay-btn${autoRotate?' active':''}`}
+                      style={{padding:'3px 0', width:'100%', gridColumn:2, gridRow:'1 / span 2', alignSelf:'center'}}
+                      onClick={() => {
+                        const v = !autoRotate; setAutoRotate(v); boxSimRef.current.autoRotate = v
+                        if (!v && boxSimRef.current.box) boxSimRef.current.box.boxAngularVel = 0
+                      }}>Rotate</button>
+                  </>) : (<>
+                    <button className={`action-btn replay-btn${showCount?' active':''}`}
+                      style={{padding:'3px 0', width:'100%'}} onClick={() => setShowCount(f => !f)}>Count</button>
+                    <button className={`action-btn replay-btn${showCharge?' active':''}`}
+                      style={{padding:'3px 0', width:'100%'}} onClick={() => setShowCharge(f => !f)}>Charge</button>
+                    <button className={`action-btn replay-btn${showGraph?' active':''}`}
+                      style={{padding:'3px 0', width:'100%'}} onClick={() => setShowGraph(f => !f)}>Graph</button>
+                    <button className={`action-btn replay-btn${effectiveShowField?' active':''}`}
+                      style={{padding:'3px 0', width:'100%'}}
+                      title={fieldBlur ? undefined : 'Simple quality: strain field drawn crisp (no blur)'}
+                      onClick={() => setShowField(f => !f)}>Field</button>
+                  </>)}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Mini blob preview — click to switch to Glass tab */}
+        {showMiniView && (
+          <div className="blob-box" onClick={() => setTab('glass')} style={{cursor:'pointer', padding:0}}>
+            <canvas ref={miniCanvasRef} style={{ display:'block', width:'100%', height:'100%' }} />
+          </div>
+        )}
+      </header>
+
+      {/* ── Main area ── */}
+      <div className="main">
+
+        {/* Left visuals panel — shown when any toggle is active */}
+        {(showGraph || showCount || showCharge || effectiveShowField || showDev) && (
+          <div className="viz-panel" style={{ overflowY: 'auto', overflowX: 'hidden', minHeight: 0, maxHeight: '100%' }}>
+
+            {/* Particle key — Particles tab only (hidden on Bulk Material) */}
+            {tab === 'melt' && (() => {
+              const labelStyle = { fontSize: 22, color: darkMode ? '#999' : '#666', fontFamily: 'system-ui, sans-serif' }
+              const sio2Atoms = [
+                { iconR: 6,   type: 'Si', label: <><b>Si</b> <sup>δ+</sup></> },
+                { iconR: 4.5, type: 'O',  label: <><b>O</b>  <sup>δ−</sup></> },
+              ]
+              const na2oAtoms = [
+                { iconR: 6,   type: 'Na', label: <><b>Na</b><sup>+</sup></> },
+                { iconR: 4.5, type: 'O',  label: <><b>O</b> <sup>2−</sup></> },
+              ]
+              const groupGrid = atoms => (
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', rowGap: 3 }}>
+                  {atoms.map(({ iconR, type }, i) => (
+                    <div key={i} style={{ display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
+                      <GlassAtomIcon type={type} iconR={iconR} showCharge={showCharge} darkMode={darkMode} />
+                    </div>
+                  ))}
+                  {atoms.map(({ label }, i) => (
+                    <div key={i} style={{ display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
+                      <span style={labelStyle}>{label}</span>
+                    </div>
+                  ))}
+                </div>
+              )
+              return (
+                <div style={{ display: 'flex', flexShrink: 0, padding: '0 6px', gap: 6 }}>
+                  <div style={{ flex: 1, border: '1.5px solid goldenrod', borderRadius: 4, padding: '4px 4px 2px', boxShadow: '0 0 0 1px rgba(0,0,0,0.6), 0 0 8px rgba(212,160,32,0.5)' }}>
+                    {groupGrid(sio2Atoms)}
+                    <div style={{ textAlign: 'center', fontSize: 10, color: 'goldenrod', fontFamily: 'system-ui, sans-serif', letterSpacing: '0.08em', marginTop: 2 }}>SiO₂</div>
+                  </div>
+                  <div style={{ flex: 1, border: '1.5px solid rgba(74,170,96,0.7)', borderRadius: 4, padding: '4px 4px 2px', boxShadow: '0 0 0 1px rgba(0,0,0,0.6), 0 0 8px rgba(74,170,96,0.35)' }}>
+                    {groupGrid(na2oAtoms)}
+                    <div style={{ textAlign: 'center', fontSize: 10, color: '#4aaa60', fontFamily: 'system-ui, sans-serif', letterSpacing: '0.08em', marginTop: 2 }}>Na₂O</div>
+                  </div>
+                </div>
+              )
+            })()}
+
+            {/* Bond strain gradient — field legend (Particles tab only) */}
+            {tab === 'melt' && effectiveShowField && (
+              <svg viewBox="0 0 200 50" width="100%" style={{ display: 'block', flexShrink: 0 }}>
+                <defs>
+                  <linearGradient id="gl-strain-grad" x1="0" x2="1" y1="0" y2="0">
+                    {darkMode ? (<>
+                      <stop offset="0%"   stopColor="rgb(200,196,188)" />
+                      <stop offset="20%"  stopColor="rgb(195,90,255)" />
+                      <stop offset="55%"  stopColor="rgb(240,30,225)" />
+                      <stop offset="100%" stopColor="rgb(255,70,185)" />
+                    </>) : (<>
+                      <stop offset="0%"   stopColor="rgb(172,167,160)" />
+                      <stop offset="20%"  stopColor="rgb(190,100,220)" />
+                      <stop offset="55%"  stopColor="rgb(150,20,200)" />
+                      <stop offset="100%" stopColor="rgb(255,40,160)" />
+                    </>)}
+                  </linearGradient>
+                </defs>
+                <text x="0" y="14" style={{ fontSize: '14px', fill: darkMode ? '#999' : '#666', fontFamily: 'Lexend, system-ui, sans-serif', fontWeight: 700 }}>Energy in fields:</text>
+                <rect x="0" y="18" width="200" height="10" fill="url(#gl-strain-grad)" rx="1" />
+                <text x="0"   y="44" style={{ fontSize: '14px', fill: darkMode ? '#999' : '#666', fontFamily: 'Lexend, system-ui, sans-serif', fontWeight: 700 }}>Low</text>
+                <text x="200" y="44" style={{ fontSize: '14px', fill: darkMode ? '#999' : '#666', fontFamily: 'Lexend, system-ui, sans-serif', fontWeight: 700, textAnchor: 'end' }}>High</text>
+              </svg>
+            )}
+
+            {/* Bond count table — mirrors concrete v4 layout (Particles tab only) */}
+            {tab === 'melt' && showCount && bondCounts && (() => {
+              const initial = initialBondCounts ?? bondCounts
+              const cols = [
+                { key: 'sio', label: 'Si-O', color: '#d4a020', typeA: 'Si', rA: 5,   typeB: 'O', rB: 3.5 },
+                initial.nao.total > 0
+                  ? { key: 'nao', label: 'Na-O', color: '#4aaa60', typeA: 'Na', rA: 4.5, typeB: 'O', rB: 3.5 }
+                  : null,
+                initial.cao.total > 0
+                  ? { key: 'cao', label: 'Ca-O', color: '#4a96be', typeA: 'Ca', rA: 4.5, typeB: 'O', rB: 3.5 }
+                  : null,
+              ].filter(Boolean)
+
+              // Same two rows on heating and cooling:
+              //  · Bonds  — intact bonds now, and that as a % of the ORIGINAL solid's bonds (fixed
+              //             denominator for the whole trip, so heat and cool runs are comparable)
+              //  · Change — signed change since the current run began ("since heat" / "since cool"),
+              //             with the % it started from. Cooling resets the reference, no new row.
+              const run = bondRef?.phase ?? null
+              const refCounts = bondRef?.counts ?? null
+              const colData = cols.map(({ key, label, color, typeA, rA, typeB, rB }) => {
+                const orig = initial[key].intact, now = bondCounts[key].intact
+                const from = refCounts ? refCounts[key].intact : null
+                return {
+                  key, label, color, typeA, rA, typeB, rB, now,
+                  pct:    orig > 0 ? now / orig * 100 : null,
+                  delta:  from != null ? now - from : null,
+                  fromPct: from != null && orig > 0 ? from / orig * 100 : null,
+                }
+              })
+              const gridCols = `52px ${cols.map(() => '0.9fr').join(' ')}`
+              const rowLabelStyle = { fontSize: 13, letterSpacing: '0.07em', color: darkMode ? '#888' : '#666', fontFamily: 'system-ui, sans-serif', lineHeight: 1.1 }
+              const runColor = run === 'heat' ? (darkMode ? '#e8a060' : '#b8662a') : run === 'cool' ? (darkMode ? '#70b0e8' : '#2a6ea8') : (darkMode ? '#666' : '#999')
+              const numStyle = (color, bold) => ({ fontSize: 22, fontVariantNumeric: 'tabular-nums', color, fontWeight: bold ? 700 : 500, lineHeight: 1.1, fontFamily: 'system-ui, sans-serif', whiteSpace: 'nowrap' })
+              const subStyle = color => ({ fontSize: 15, color, opacity: 0.75, fontVariantNumeric: 'tabular-nums', lineHeight: 1.1, fontFamily: 'system-ui, sans-serif', whiteSpace: 'nowrap' })
+              const dash = <span style={{ fontSize: 21, color: darkMode ? '#333' : '#bbb', fontFamily: 'system-ui, sans-serif' }}>—</span>
+              const signColor = v => v > 0 ? '#50c878' : v < 0 ? '#e06060' : '#888'
+
+              return (
+                <div style={{ padding: '2px 6px', display: 'flex', flexDirection: 'column', gap: 0 }}>
+                  {/* Column headers */}
+                  <div style={{ display: 'grid', gridTemplateColumns: gridCols, gap: 0, alignItems: 'end', marginBottom: 4 }}>
+                    <span />
+                    {colData.map(({ key, label, color, typeA, rA, typeB, rB }) => (
+                      <div key={key} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 3 }}>
+                          <GlassAtomIcon type={typeA} iconR={rA} showCharge={showCharge} darkMode={darkMode} />
+                          <span style={{ fontSize: 9, color: darkMode ? '#444' : '#bbb', lineHeight: 1 }}>—</span>
+                          <GlassAtomIcon type={typeB} iconR={rB} showCharge={showCharge} darkMode={darkMode} />
+                        </div>
+                        <span style={{ fontSize: 12, color, letterSpacing: '0.04em', lineHeight: 1, textAlign: 'center', fontFamily: 'system-ui, sans-serif' }}>{label}</span>
+                      </div>
+                    ))}
+                  </div>
+                  {/* Value rows */}
+                  <div style={{ display: 'grid', gridTemplateColumns: gridCols, gap: 0, alignItems: 'baseline', marginBottom: 5 }}>
+                    <span style={rowLabelStyle}>Bonds</span>
+                    {colData.map(d => (
+                      <div key={d.key} style={{ textAlign: 'center' }}>
+                        <div style={numStyle(d.color, true)}>{d.now}</div>
+                        {d.pct != null && <div style={subStyle(d.color)}>{Math.round(d.pct)}%</div>}
+                        <div style={subStyle(darkMode ? '#999' : '#777')}>{d.fromPct != null ? `from ${Math.round(d.fromPct)}%` : '\u00a0'}</div>
+                      </div>
+                    ))}
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: gridCols, gap: 0, alignItems: 'baseline', marginBottom: 3 }}>
+                    <span style={rowLabelStyle}>Change</span>
+                    {colData.map(d => (
+                      <div key={d.key} style={{ textAlign: 'center' }}>
+                        {d.delta == null ? dash
+                          : <div style={numStyle(signColor(d.delta), false)}>{(d.delta > 0 ? '+' : d.delta < 0 ? '−' : '') + Math.abs(d.delta)}</div>}
+                      </div>
+                    ))}
+                    <span style={{ gridColumn: '1 / -1', fontSize: 11, letterSpacing: '0.06em', color: runColor, fontFamily: 'system-ui, sans-serif', lineHeight: 1.2 }}>{run ? `since ${run} start` : 'no run yet'}</span>
+                  </div>
+                  <div style={{ fontSize: 10, color: darkMode ? '#666' : '#999', letterSpacing: '0.04em', fontFamily: 'system-ui, sans-serif', marginTop: 1 }}>% = share of the original solid's bonds</div>
+                </div>
+              )
+            })()}
+
+            {/* Graph in sidebar */}
+            {showGraph && (() => {
+              // x-axis label = a dropdown (time ↔ energy), sitting exactly where drawTEGraph would put
+              // the label: centred under the plot, same bold 14px Lexend, in the axis colour.
+              const axisCol = m => m === 'time' ? GRAPH_TIME_COL[darkMode ? 'dark' : 'light'] : QTY_COLORS.energy[darkMode ? 'dark' : 'light']
+              const AXES = [['time', 'time (s)'], ['energy', 'energy added (kJ)']]
+              const font = 'bold 14px Lexend, system-ui, sans-serif'
+              const col = axisCol(graphXMode)
+              return (
+                <div style={{ position:'relative', marginBottom:4 }}>
+                  <canvas ref={graphCanvasRef}
+                    style={{ display:'block', width:'100%', height:200 }}
+                    onMouseMove={e => { const r = e.currentTarget.getBoundingClientRect(); graphUiRef.current.mouse = { x: e.clientX - r.left, y: e.clientY - r.top } }}
+                    onMouseLeave={() => { graphUiRef.current.mouse = null }}
+                    onClick={e => { const r = e.currentTarget.getBoundingClientRect(); graphUiRef.current.clicks.push({ x: e.clientX - r.left, y: e.clientY - r.top }) }}
+                  />
+                  <div ref={graphMenuRef} style={{ position:'absolute', bottom:3, left:`calc(${GRAPH_PAD.L}px + (100% - ${GRAPH_PAD.L + GRAPH_PAD.R}px) / 2)`, transform:'translateX(-50%)' }}>
+                    <button onClick={() => setGraphMenuOpen(o => !o)} title="Graph temperature against time or energy added"
+                      style={{ display:'flex', alignItems:'center', gap:6, padding:'0 4px', lineHeight:'18px', font, color:col,
+                               background:'none', border:'none', cursor:'pointer', whiteSpace:'nowrap' }}>
+                      {AXES.find(([v]) => v === graphXMode)[1]}
+                      {/* dropdown triangle, as big as the text */}
+                      <svg width="14" height="12" viewBox="0 0 14 12" aria-hidden="true" style={{ flexShrink:0 }}>
+                        <polygon points="0,1 14,1 7,12" fill={col} />
+                      </svg>
+                    </button>
+                    {graphMenuOpen && (
+                      <div role="menu" style={{ position:'absolute', bottom:'100%', left:'50%', transform:'translateX(-50%)', marginBottom:4, zIndex:5,
+                        padding:'3px 0', borderRadius:4, whiteSpace:'nowrap',
+                        background: darkMode ? 'rgba(24,22,20,0.97)' : 'rgba(248,246,241,0.98)',
+                        border: darkMode ? '1px solid rgba(255,255,255,0.22)' : '1px solid rgba(0,0,0,0.22)',
+                        boxShadow:'0 3px 12px rgba(0,0,0,0.45)' }}>
+                        {AXES.map(([v, label]) => (
+                          <button key={v} role="menuitemradio" aria-checked={v === graphXMode}
+                            onClick={() => { setGraphXMode(v); setGraphMenuOpen(false) }}
+                            style={{ display:'flex', alignItems:'center', gap:6, width:'100%', padding:'4px 12px 4px 8px', font, color:axisCol(v),
+                                     textAlign:'left', border:'none', cursor:'pointer',
+                                     background: v === graphXMode ? (darkMode ? 'rgba(255,255,255,0.10)' : 'rgba(0,0,0,0.07)') : 'none' }}>
+                            <span style={{ width:14, textAlign:'center' }}>{v === graphXMode ? '✓' : ''}</span>{label}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )
+            })()}
+
+            {showDev && <>
+              <div className="viz-section-title">Dev (type "dev" to hide)</div>
+              {/* ── Tune these ── newest params / ones flagged for tuning live HERE, at the top, so they're
+                  easy to find. Move a control down into its normal section once its value is settled. */}
+              <div style={{border:'1px solid #6a5a9a', borderRadius:4, padding:'6px 8px 8px', marginBottom:10, background:'rgba(106,90,154,0.12)'}}>
+                <div style={{fontSize:11, color:'#c8b8ff', marginBottom:6, letterSpacing:'0.06em'}}>── Tune these ──</div>
+                <label style={{display:'flex', alignItems:'center', gap:6, fontSize:12, color:'#ccc', cursor:'pointer'}}>
+                  <input type="checkbox" checked={coolStrainScaled} onChange={e => { setCoolStrainScaledState(e.target.checked); setCoolStrainScaled(e.target.checked) }} style={{accentColor:'#88ddaa'}} />
+                  Cooling: strain vs longer-bond length
+                </label>
+                <label style={{display:'flex', alignItems:'center', gap:6, fontSize:12, color:'#ccc', cursor:'pointer'}}>
+                  <input type="checkbox" checked={coolHoldBonds} onChange={e => { setCoolHoldBondsState(e.target.checked); setCoolHoldBonds(e.target.checked) }} style={{accentColor:'#88ddaa'}} />
+                  Cooling: hold bonds above cryst lock
+                </label>
+                <div style={{fontSize:10, color:'#777', marginBottom:8}}>Keep the bond count flat on cooling until bonds start forming (~1050 °C). Off = the old behaviour: the +10% "longer cooled bonds" length read as strain and snapped bonds, and hot flicker broke bonds that couldn't reform → the count dipped ~17% first. Particles tab only; the background catch-up states always use ON.</div>
+                <div style={{fontSize:11, color:'#888', marginBottom:2}}>Bulk melt lead / lag vs particles: <span style={{color:'#a090d0'}}>{bulkLead === 0 ? 'matched' : bulkLead > 0 ? `${bulkLead} °C ahead` : `${-bulkLead} °C behind`}</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={-200} max={200} step={10} value={bulkLead} onChange={e => { const v = +e.target.value; setBulkLeadState(v); setBulkMeltLead(v) }} />
+                <div style={{fontSize:10, color:'#777', marginBottom:8}}>Heating: Bulk melts to the Particles tab's measured bond-breaking curve (bulkMelt.js). Shift it earlier (+) or later (−). Applies live; the bundled snapshots are melted at 0.</div>
+                {[['hi', 'Cooling band: starts at', 500, 1400, 25, ' °C'],
+                  ['lo', 'Cooling band: complete by', 100, 900, 25, ' °C'],
+                  ['w',  'Cooling band: each bond fades over', 10, 400, 10, ' °C']].map(([k, label, mn, mx, st, unit]) => (
+                  <div key={k}>
+                    <div style={{fontSize:11, color:'#888', marginBottom:2}}>{label}: <span style={{color:'#a090d0'}}>{coolBand[k]}{unit}</span></div>
+                    <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                      min={mn} max={mx} step={st} value={coolBand[k]}
+                      onChange={e => { const next = { ...coolBand, [k]: +e.target.value }
+                        if (next.lo > next.hi - 25) { if (k === 'lo') next.lo = next.hi - 25; else next.hi = next.lo + 25 }
+                        setCoolBandState(next); setCoolBand(next) }} />
+                  </div>
+                ))}
+                <div style={{fontSize:10, color:'#777', marginBottom:8}}>Cooling, both tabs: Particles bonds each fade pink → grey at their own random temperature in this band; the Bulk blob turns to clear glass in step with the share of bonds gone grey. (Bulk rigidity has its own sliders below.)</div>
+                <div style={{fontSize:11, color:'#888', marginBottom:2}}>Hardening glass wall gap: <span style={{color:'#a090d0'}}>{glassWallPad} × orb r</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={0} max={8} step={0.5} value={glassWallPad} onChange={e => { const v = +e.target.value; setGlassWallPadState(v); setGlassWallPad(v) }} />
+                <div style={{fontSize:10, color:'#777', marginBottom:8}}>The blob's drawn outline sits 12–22 px outside its physics circles. Rigid glass (below the rigid temp) hits the walls with its exact drawn outline. While hardening, each orb stops this many radii short of the walls, ramped in with hardness, so the visible edge meets the wall instead of being clipped flat. Hot liquid is unaffected; 0 = no gap while hardening.</div>
+                <div style={{fontSize:11, color:'#888', marginBottom:2}}>Heat lead (Particles): <span style={{color:'#a090d0'}}>{heatLeadSteps === 0 ? 'off' : `${heatLeadSteps} steps`}</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={0} max={80} step={5} value={heatLeadSteps} onChange={e => setHeatLeadSteps(+e.target.value)} />
+                <div style={{fontSize:10, color:'#777', marginBottom:8}}>While heating, particle physics runs this many sim steps ahead of the ramp so bond breaking keeps up (0 = off). Readout and graph are unaffected.</div>
+                <div style={{fontSize:11, color:'#888', marginBottom:2}}>Cold motion (at 0 °C): <span style={{color:'#a090d0'}}>{Math.round(motionCold * 100)}% of full</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={0} max={1} step={0.02} value={motionCold} onChange={e => { const v = +e.target.value; setMotionColdState(v); setMotionCold(v) }} />
+                <div style={{fontSize:11, color:'#888', marginBottom:2}}>Full motion reached at: <span style={{color:'#a090d0'}}>{motionFullT} °C</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={100} max={1000} step={25} value={motionFullT} onChange={e => { const v = +e.target.value; setMotionFullTState(v); setMotionFullT(v) }} />
+                <div style={{fontSize:10, color:'#777', marginBottom:8}}>Particles tab, render only: lattice-atom jiggle ramps linearly from the cold value at 0 °C to full here (bonds start going pink ~500 °C).</div>
+                {[['rim', 'Glass rim brightness', 0, 4, 0.05, v => v.toFixed(2)],
+                  ['dark', 'Glass body tint (opacity)', 0, 1, 0.01, v => `${Math.round(v * 100)}%`],
+                  ['gain', 'Glass edge curvature (rim width)', 2, 16, 0.5, v => `${v} px`],
+                  ['lightDeg', 'Glass light angle (fixed to screen)', -180, 180, 5, v => `${v}°`]].map(([k, label, mn, mx, st, fmt]) => (
+                  <div key={k}>
+                    <div style={{fontSize:11, color:'#888', marginBottom:2}}>{label}: <span style={{color:'#a090d0'}}>{fmt(glassLook[k])}</span></div>
+                    <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                      min={mn} max={mx} step={st} value={glassLook[k]}
+                      onChange={e => { const v = +e.target.value; setGlassLookState(g => ({ ...g, [k]: v })); glassLookRef.current[k] = v }} />
+                  </div>
+                ))}
+                <div style={{fontSize:10, color:'#777', marginBottom:8}}>Bulk cooled glass (cooling only): clear tinted body, rim lit from a light that stays fixed while the box spins (180° = from the left), darker edge on the shadow side, faint exit glow opposite. Fades in 1000 → 500 °C.</div>
+                <div style={{fontSize:11, color:'#888', marginBottom:2}}>Bulk glass starts hardening at: <span style={{color:'#a090d0'}}>{naHardenT} °C</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={500} max={1300} step={25} value={naHardenT} onChange={e => { const v = Math.max(+e.target.value, naRigidT + 25); setNaHardenTState(v); setNaHardenTemp(v) }} />
+                <div style={{fontSize:11, color:'#888', marginBottom:2}}>Bulk glass fully rigid at: <span style={{color:'#a090d0'}}>{naRigidT} °C</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={100} max={900} step={25} value={naRigidT} onChange={e => { const v = Math.min(+e.target.value, naHardenT - 25); setNaRigidTState(v); setNaRigidTemp(v) }} />
+                <div style={{fontSize:10, color:'#777', marginBottom:8}}>Bulk: the cooled blob stiffens gradually between these (holds its shape more and more, falls more like a solid), becoming a true rigid body at the lower one.</div>
+                <div style={{fontSize:11, color:'#888', marginBottom:2}}>Bond flicker damping: <span style={{color:'#a090d0'}}>{bondHyst <= 1.001 ? 'off' : `×${bondHyst.toFixed(2)}`}</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={1} max={1.3} step={0.02} value={bondHyst} onChange={e => { const v = +e.target.value; setBondHystState(v); setBondHyst(v) }} />
+                <div style={{fontSize:10, color:'#777', marginBottom:8}}>A drawn bond appears at the normal distance but stays until its atoms are this much further apart — stops bonds blinking at the cutoff (Particles, all temps).</div>
+                <div style={{fontSize:11, color:'#888', marginBottom:2}}>Cooling bonds lock at: <span style={{color:'#a090d0'}}>{bondLockTemp} °C</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={100} max={900} step={25} value={bondLockTemp} onChange={e => { const v = +e.target.value; setBondLockTempState(v); setBondLockTemp(v) }} />
+                <div style={{fontSize:10, color:'#777', marginBottom:8}}>Fast + slow cool (Particles): every bond present is locked in here, melted Na gets 2–3 bonds to nearby O, and nothing breaks or forms below — no flashing bonds.</div>
+                <label style={{display:'flex', alignItems:'center', gap:6, fontSize:12, color:'#ccc', marginBottom:4, cursor:'pointer'}}>
+                  <input type="checkbox" checked={crystTemplate} onChange={e => { setCrystTemplateState(e.target.checked); setCrystTemplate(e.target.checked) }} style={{accentColor:'#88ddaa'}} />
+                  Slow cool re-grows sand honeycomb
+                </label>
+                <div style={{fontSize:11, color:'#888', marginBottom:2}}>Crystal pull: <span style={{color:'#a090d0'}}>{templK.toFixed(2)}</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={0} max={0.15} step={0.01} value={templK} onChange={e => { const v = +e.target.value; setTemplKState(v); setTemplK(v) }} />
+                <div style={{fontSize:11, color:'#888', marginBottom:2}}>Crystal starts forming at: <span style={{color:'#a090d0'}}>{templHi} °C</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={700} max={1500} step={50} value={templHi} onChange={e => { const v = +e.target.value; setTemplHiState(v); setTemplHi(v) }} />
+                <div style={{fontSize:11, color:'#888', marginBottom:2}}>Bonds lock in below: <span style={{color:'#a090d0'}}>{templReint} °C</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={100} max={1000} step={50} value={templReint} onChange={e => { const v = +e.target.value; setTemplReintState(v); setTemplReint(v) }} />
+                <div style={{fontSize:10, color:'#777', marginBottom:8}}>Slow cool only (Particles): melted Si/O are pulled onto the original sand lattice from the start temp down, Na into ring centres; re-bonding waits for the lock temp. Fast cool stays amorphous.</div>
+                <label style={{display:'flex', alignItems:'center', gap:6, fontSize:12, color:'#ccc', cursor:'pointer'}}>
+                  <input type="checkbox" checked={grainFeedback} onChange={e => { setGrainFeedbackState(e.target.checked); setGrainFeedback(e.target.checked) }} style={{accentColor:'#88ddaa'}} />
+                  Per-grain Si-O feedback — uncheck for global
+                </label>
+              </div>
+              <button onClick={regenCandidates} disabled={genProgress !== null}
+                style={{width:'100%', padding:'6px 8px', marginBottom:8, fontSize:12, cursor: genProgress!==null?'default':'pointer',
+                  background: genProgress!==null ? '#3a3a2a' : '#4a3a6a', color:'#e0d0ff',
+                  border:'1px solid #6a5a9a', borderRadius:4}}>
+                {genProgress !== null ? `Generating candidate states… ${Math.round(genProgress*100)}%` : 'Regenerate candidate states'}
+              </button>
+              <label style={{display:'flex', alignItems:'center', gap:6, fontSize:12, color:'#ccc', marginBottom:8, cursor:'pointer'}}>
+                <input type="checkbox" checked={longerCooledBonds} onChange={e => setLongerCooledBonds(e.target.checked)} style={{accentColor:'#88ddaa'}} />
+                Longer cooled bonds
+              </label>
+              <label style={{display:'flex', alignItems:'center', gap:6, fontSize:12, color:'#ccc', marginBottom:8, cursor:'pointer'}}>
+                <input type="checkbox" checked={showGoBox} onChange={e => setShowGoBox(e.target.checked)} style={{accentColor:'#88ddaa'}} />
+                Temperature GO box
+              </label>
+
+              {/* ── Macro-vs-particle melt match ── tune onset/full so Macro tracks Particle. */}
+              <div style={{fontSize:11, color:'#aaa', marginBottom:4, letterSpacing:'0.06em'}}>── Melt match ──</div>
+              <div style={{fontFamily:'monospace', fontSize:11, background:'rgba(255,220,80,0.06)', border:'1px solid rgba(255,220,80,0.18)', borderRadius:4, padding:'5px 8px', marginBottom:6}}>
+                <div>particles (fBroken ÷ end): <span style={{color:'#88ddaa'}}>{(Math.min(1, fBroken / PARTICLE_FB_END) * 100).toFixed(0)}%</span></div>
+                <div>bulk (grains melted):      <span style={{color:'#e0a060'}}>{(boxMeltFrac * 100).toFixed(0)}%</span></div>
+                <div style={{color:'#888'}}>bulk target @ {Math.round(meltLocalTemp)}°C: {(macroMeltTarget(meltLocalTemp) * 100).toFixed(0)}%</div>
+              </div>
+              <div style={{fontSize:10, color:'#777', marginBottom:8}}>Bulk follows the measured particle curve (bulkMelt.js PARTICLE_MELT_CURVE); shift it with "Bulk melt lead / lag" in Tune these.</div>
+
+              <label style={{display:'flex', alignItems:'center', gap:6, fontSize:12, color:'#ccc', marginBottom:8, cursor:'pointer'}}>
+                <input type="checkbox" checked={showMiniView} onChange={e => setShowMiniView(e.target.checked)} style={{accentColor:'#88ddaa'}} />
+                Mini photo view
+              </label>
+
+              {/* ── Quality tier ── global, so it lives outside the per-tab blocks. Same as the
+                  toolbar dropdown: a manual pick (sets the auto-quality ceiling). */}
+              <div style={{fontSize:11, color:'#aaa', marginBottom:4, letterSpacing:'0.06em'}}>── Quality ──</div>
+              <div style={{fontSize:11, color:'#888', marginBottom:4}}>
+                Tier <span style={{color:'#a090d0'}}>{quality}</span>
+                <span style={{color:'#666'}}> (speed test {detectPerformanceTier().tier ?? 'n/a'}, trail {detectPerformanceTier().trail?.toFixed(1)} ms; ceiling {adaptRef.current.ceiling})</span>
+              </div>
+              <div style={{display:'flex', gap:3}}>
+                {(detectPerformanceTier().tier === 'simple' ? ['detailed','simple'] : ['hires','detailed','simple']).map(q => (
+                  <button key={q} onClick={() => pickQuality(q)}
+                    style={{fontSize:10, padding:'2px 7px', cursor:'pointer', userSelect:'none',
+                      background: quality===q ? '#6050a0' : '#2a2a3a',
+                      color: quality===q ? '#fff' : '#aaa',
+                      border: quality===q ? '1px solid #a090e0' : '1px solid #444',
+                      borderRadius:3}}>{q}</button>
+                ))}
+              </div>
+              <div style={{fontSize:10, color:'#666', marginTop:3, marginBottom:8}}>
+                simple: no blurred bond-strain field on the melt tab
+              </div>
+              {tab === 'melt' && <>
+                <div style={{fontFamily:'monospace', fontSize:12, color:'#e0d080', background:'rgba(255,220,80,0.07)', border:'1px solid rgba(255,220,80,0.2)', borderRadius:4, padding:'5px 8px', marginBottom:8}}>
+                  <div style={{fontSize:10, color:'#888', marginBottom:2, letterSpacing:'0.05em'}}>TARGET ENERGY (ePerParticle)</div>
+                  <div>{targetE.toExponential(4)}  <span style={{color:'#88ddaa'}}>{(fBroken*100).toFixed(1)}% broken</span></div>
+                  <div style={{marginTop:3}}><span style={{fontSize:10, color:'#888'}}>maxStrain ×1k: </span><span style={{color:'#ff9999'}}>{(maxAvgStrain * 1000).toFixed(1)}</span></div>
+                  <div style={{marginTop:2}}><span style={{fontSize:10, color:'#888'}}>avgStrain ×1k: </span><span style={{color:'#aaddff'}}>{(meanAvgStrain * 1000).toFixed(1)}</span></div>
+                  <div style={{marginTop:2}}><span style={{fontSize:10, color:'#888'}}>effThresh ×1k: </span><span style={{color:'#ffcc88'}}>{(meanEffThreshold * 1000).toFixed(1)}</span></div>
+                  <div style={{marginTop:3}}><span style={{fontSize:10, color:'#888'}}>sev fires/sec: </span><span style={{color:'#ffaa88'}}>{sevFireRate.toFixed(1)}</span></div>
+                </div>
+                <div style={{fontSize:11, color:'#888', marginTop:6, marginBottom:2}}>Sim speed (viz): <span style={{color:'#a090d0'}}>{simSpeed.toFixed(2)}×</span> <span style={{fontSize:9, color:'#666'}}>&lt;1 skips frames · 1+ steps/frame</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={0.1} max={4} step={0.05} value={simSpeed}
+                  onChange={e => { const v = +e.target.value; setSimSpeed(v); window._simSpeed = v }} />
+                <div style={{fontSize:11, color:'#aaa', marginTop:10, marginBottom:3, letterSpacing:'0.06em'}}>── Active: Na₂O breaking ──</div>
+                <div style={{fontSize:11, color:'#888', marginTop:6, marginBottom:2}}>Si-O break strain: <span style={{color:'#a090d0'}}>{breakStrain.toFixed(3)}</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={0.02} max={0.30} step={0.005} value={breakStrain}
+                  onChange={e => { const v = +e.target.value; setBreakStrainState(v); setBreakStrain(v) }} />
+                <div style={{fontSize:11, color:'#888', marginTop:6, marginBottom:2}}>Na break strain: <span style={{color:'#a090d0'}}>{naBreakStrain.toFixed(3)}</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={0.005} max={0.15} step={0.005} value={naBreakStrain}
+                  onChange={e => { const v = +e.target.value; setNaBreakStrainState(v); setNaBreakStrain(v) }} />
+                <div style={{fontSize:11, color:'#888', marginBottom:2}}>Feedback gain ×: <span style={{color:'#a090d0'}}>{feedbackGainMult.toFixed(1)}</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={0} max={200} step={1} value={feedbackGainMult}
+                  onChange={e => { const v = +e.target.value; setFeedbackGainMultState(v); setFeedbackGainMult(v) }} />
+                <div style={{fontSize:11, color:'#888', marginTop:6, marginBottom:2}}>Intact bond stiffness ×: <span style={{color:'#a090d0'}}>{bondStiffMult.toFixed(1)}</span> (× pair k, beyond capture)</div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={0} max={5} step={0.1} value={bondStiffMult}
+                  onChange={e => { const v = +e.target.value; setBondStiffMultState(v); setBondStiffMult(v) }} />
+                <div style={{fontSize:11, color:'#888', marginTop:6, marginBottom:2}}>Sev trigger dist: <span style={{color:'#a090d0'}}>{sevTriggerDist.toFixed(1)} px</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={5} max={20} step={0.5} value={sevTriggerDist}
+                  onChange={e => { const v = +e.target.value; setSevTriggerDistState(v); setSevTriggerDist(v) }} />
+                <div style={{fontSize:11, color:'#888', marginTop:6, marginBottom:2}}>Sev cooldown: <span style={{color:'#a090d0'}}>{sevCooldown} steps</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={0} max={300} step={10} value={sevCooldown}
+                  onChange={e => { const v = +e.target.value; setSevCooldownState(v); setSevCooldown(v) }} />
+                <div style={{fontSize:11, color:'#888', marginTop:6, marginBottom:2}}>Sev pull (ion→O): <span style={{color:'#a090d0'}}>{sevPullK.toFixed(3)}</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={0} max={0.05} step={0.001} value={sevPullK}
+                  onChange={e => { const v = +e.target.value; setSevPullKState(v); setSevPullK(v) }} />
+                <div style={{fontSize:11, color:'#aaa', marginTop:10, marginBottom:3, letterSpacing:'0.06em'}}>── Active: freed travel ──</div>
+                <div style={{fontSize:11, color:'#888', marginTop:6, marginBottom:2}}>Freed speed ×: <span style={{color:'#a090d0'}}>{freedSpeedMult.toFixed(2)}</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={0.25} max={15} step={0.25} value={freedSpeedMult}
+                  onChange={e => { const v = +e.target.value; setFreedSpeedMultState(v); setFreedSpeedMult(v) }} />
+                <div style={{fontSize:11, color:'#888', marginTop:6, marginBottom:2}}>Freed τ (travel): <span style={{color:'#a090d0'}}>{freedTau.toFixed(3)}</span> → straight run ≈ {(1/freedTau).toFixed(0)} substeps</div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={0.01} max={0.2} step={0.005} value={freedTau}
+                  onChange={e => { const v = +e.target.value; setFreedTauState(v); setFreedTau(v) }} />
+                <div style={{fontSize:11, color:'#aaa', marginTop:10, marginBottom:3, letterSpacing:'0.06em'}}>── Active: melt / cooling ──</div>
+                <div style={{fontSize:11, color:'#888', marginTop:6, marginBottom:2}}>Melt heat capacity plateau (Na₂O, &gt;750°C): <span style={{color:'#a090d0'}}>{hcPlateau.toFixed(2)}×</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={1} max={8} step={0.1} value={hcPlateau}
+                  onChange={e => { const v = +e.target.value; setHcPlateau(v); hcPlateauRef.current = v }} />
+                <div style={{fontSize:11, color:'#888', marginTop:6, marginBottom:2}}>Si-Si repulsion r₀: <span style={{color:'#a090d0'}}>{siSiRepR0.toFixed(1)} px</span> → min Si-O-Si ≈ {Math.round(2 * Math.asin(Math.min(1, siSiRepR0 / (2 * sioR0))) * 180 / Math.PI)}°</div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={10} max={20} step={0.2} value={siSiRepR0}
+                  onChange={e => { const v = +e.target.value; setSiSiRepR0State(v); setSiSiRepR0(v) }} />
+                <div style={{fontSize:11, color:'#888', marginTop:6, marginBottom:2}}>Na-Na repulsion r₀: <span style={{color:'#a090d0'}}>{naNaRepR0.toFixed(1)} px</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={6} max={40} step={0.5} value={naNaRepR0}
+                  onChange={e => { const v = +e.target.value; setNaNaRepR0State(v); setNaNaRepR0(v) }} />
+                <div style={{fontSize:11, color:'#888', marginBottom:2}}>Motif strength: <span style={{color:'#a090d0'}}>{motifStrength.toFixed(4)}</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={0} max={0.02} step={0.0005} value={motifStrength}
+                  onChange={e => { const v = +e.target.value; setMotifStrengthState(v); setMotifStrength(v) }} />
+                <div style={{fontSize:11, color:'#888', marginTop:6, marginBottom:2}}>Motif align (slow): <span style={{color:'#a090d0'}}>{motifAlign.toFixed(2)}</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={0} max={1} step={0.05} value={motifAlign}
+                  onChange={e => { const v = +e.target.value; setMotifAlignState(v); setMotifAlign(v) }} />
+                <div style={{fontSize:11, color:'#aaa', marginTop:10, marginBottom:4, letterSpacing:'0.06em'}}>── Overlay ──</div>
+                <div style={{fontSize:11, color:'#888', marginBottom:4}}>Atom color</div>
+                <div style={{display:'flex', gap:3, flexWrap:'wrap'}}>
+                  {['normal','freed','coordination','attract'].map(m => (
+                    <button key={m} onClick={() => setAtomColorMode(m)}
+                      style={{fontSize:10, padding:'2px 5px', cursor:'pointer', userSelect:'none',
+                        background: atomColorMode===m ? '#6050a0' : '#2a2a3a',
+                        color: atomColorMode===m ? '#fff' : '#aaa',
+                        border: atomColorMode===m ? '1px solid #a090e0' : '1px solid #444',
+                        borderRadius:3}}>
+                      {m}
+                    </button>
+                  ))}
+                </div>
+                <label style={{display:'flex', alignItems:'center', gap:4, fontSize:11, color:'rgba(255,255,255,0.42)', cursor:'pointer', marginTop:6, userSelect:'none'}}>
+                  <input type="checkbox" checked={showBrokenBonds} onChange={e => setShowBrokenBonds(e.target.checked)} style={{accentColor:'#8070c0', cursor:'pointer'}} />
+                  Show broken bonds
+                </label>
+                <label style={{display:'flex', alignItems:'center', gap:4, fontSize:11, color:'rgba(255,255,255,0.42)', cursor:'pointer', marginTop:4, userSelect:'none'}}>
+                  <input type="checkbox" checked={showLiveStats} onChange={e => setShowLiveStats(e.target.checked)} style={{accentColor:'#8070c0', cursor:'pointer'}} />
+                  Live stats HUD
+                </label>
+                <div style={{borderTop:'1px solid #333', margin:'14px 0 4px'}} />
+                <div style={{fontSize:11, color:'#aaa', marginTop:10, marginBottom:3, letterSpacing:'0.06em'}}>── Other ──</div>
+                <label style={{display:'flex', alignItems:'center', gap:6, fontSize:12, color:'#ccc', marginBottom:8, cursor:'pointer'}}>
+                  <input type="checkbox" checked={useEmaStrain} onChange={e => setUseEmaStrain(e.target.checked)} style={{accentColor:'#88ddaa'}} />
+                  EMA strain (α=0.1) — uncheck for instant break
+                </label>
+                <div style={{fontSize:11, color:'#888', marginBottom:2}}>Si-O r₀: <span style={{color:'#a090d0'}}>{sioR0} px</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={5} max={15} step={0.5} value={sioR0} onChange={e => setSioR0(+e.target.value)} />
+                <div style={{fontSize:11, color:'#888', marginTop:6, marginBottom:2}}>Attract K: <span style={{color:'#a090d0'}}>{attractK===0?'off':attractK.toFixed(3)}</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={0} max={0.5} step={0.005} value={attractK} onChange={e => setAttractK(+e.target.value)} />
+                <div style={{fontSize:11, color:'#888', marginTop:6, marginBottom:2}}>Attract falloff</div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={1} max={4} step={0.1} value={attractFalloff} onChange={e => setAttractFalloff(+e.target.value)} />
+                <div style={{fontSize:11, color:'#a090d0', textAlign:'center', marginTop:1}}>{attractFalloff.toFixed(1)}</div>
+                <div style={{fontSize:11, color:'#888', marginTop:6, marginBottom:2}}>Speed ×</div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={0.5} max={4.0} step={0.05} value={speedMult} onChange={e => setSpeedMult(+e.target.value)} />
+                <div style={{fontSize:11, color:'#a090d0', textAlign:'center', marginTop:1}}>{speedMult.toFixed(2)}</div>
+                <div style={{fontSize:11, color:'#888', marginTop:6, marginBottom:2}}>Si-O hot capture ×: <span style={{color:'#a090d0'}}>{sioHotMult.toFixed(2)}</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={1.01} max={1.50} step={0.01} value={sioHotMult}
+                  onChange={e => { const v = +e.target.value; setSioHotMultState(v); setSioHotMult(v) }} />
+                <div style={{fontSize:11, color:'#888', marginTop:6, marginBottom:2}}>Freed Si-O long-range attract (hot+cool): <span style={{color:'#a090d0'}}>{freeAttractSiOMult.toFixed(1)}</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={0} max={4} step={0.1} value={freeAttractSiOMult}
+                  onChange={e => { const v = +e.target.value; setFreeAttractSiOMultState(v); setFreeAttractSiOMult(v) }} />
+                <div style={{fontSize:11, color:'#888', marginTop:6, marginBottom:2}}>Si-O freed excl ×: <span style={{color:'#a090d0'}}>{sioExclMult.toFixed(2)}</span> → minD={((3.2+2.3)*sioExclMult).toFixed(1)}px</div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={1.0} max={2.0} step={0.05} value={sioExclMult}
+                  onChange={e => { const v = +e.target.value; setSioExclMultState(v); setSioExclMult(v) }} />
+                <div style={{fontSize:11, color:'#888', marginTop:6, marginBottom:2}}>Crystal jiggle ×: <span style={{color:'#a090d0'}}>{crystJiggleMult.toFixed(2)}</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={0.5} max={5.0} step={0.1} value={crystJiggleMult}
+                  onChange={e => { const v = +e.target.value; setCrystJiggleMultState(v); setCrystJiggleMult(v) }} />
+                <div style={{fontSize:11, color:'#888', marginTop:6, marginBottom:2}}>Si-O spring k: <span style={{color:'#a090d0'}}>{sioK.toFixed(3)}</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={0.01} max={0.20} step={0.001} value={sioK}
+                  onChange={e => { const v = +e.target.value; setSioKState(v); setSioK(v) }} />
+                <div style={{fontSize:11, color:'#888', marginTop:6, marginBottom:2}}>Na-O spring k: <span style={{color:'#a090d0'}}>{naOK.toFixed(3)}</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={0.005} max={0.10} step={0.001} value={naOK}
+                  onChange={e => { const v = +e.target.value; setNaOKState(v); setNaOK(v) }} />
+                <div style={{fontSize:11, color:'#888', marginTop:6, marginBottom:2}}>Reform strain: <span style={{color:'#a090d0'}}>{reformStrain.toFixed(3)}</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={-0.15} max={0.0} step={0.01} value={reformStrain}
+                  onChange={e => { const v = +e.target.value; setReformStrainState(v); setReformStrain(v) }} />
+                <div style={{fontSize:11, color:'#888', marginTop:6, marginBottom:2}}>Crystal anchor k: <span style={{color:'#a090d0'}}>{crystAnchorK.toFixed(3)}</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={0} max={0.15} step={0.005} value={crystAnchorK}
+                  onChange={e => { const v = +e.target.value; setCrystAnchorKState(v); setCrystAnchorK(v) }} />
+                <div style={{fontSize:11, color:'#888', marginTop:6, marginBottom:2}}>Liberate frac: <span style={{color:'#a090d0'}}>{liberateFrac.toFixed(2)}</span> (1.0=all broken)</div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={0.0} max={1.0} step={0.05} value={liberateFrac}
+                  onChange={e => { const v = +e.target.value; setLiberateFracState(v); setLiberateFrac(v) }} />
+                <div style={{fontSize:11, color:'#888', marginBottom:2}}>Na anchor k: <span style={{color:'#a090d0'}}>{naAnchorK.toFixed(3)}</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={0} max={0.15} step={0.005} value={naAnchorK}
+                  onChange={e => { const v = +e.target.value; setNaAnchorKState(v); setNaAnchorK(v) }} />
+                <div style={{fontSize:11, color:'#888', marginTop:6, marginBottom:2}}>Na liberate frac: <span style={{color:'#a090d0'}}>{naLiberateFrac.toFixed(2)}</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={0.0} max={1.0} step={0.05} value={naLiberateFrac}
+                  onChange={e => { const v = +e.target.value; setNaLiberateFracState(v); setNaLiberateFrac(v) }} />
+                <div style={{fontSize:11, color:'#888', marginTop:6, marginBottom:2}}>Break strain spread: <span style={{color:'#a090d0'}}>{breakStrainSpread.toFixed(3)}</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={0} max={0.20} step={0.005} value={breakStrainSpread}
+                  onChange={e => { const v = +e.target.value; setBreakStrainSpreadState(v); setBreakStrainSpread(v) }} />
+                <div style={{fontSize:11, color:'#888', marginBottom:2}}>Lattice speed ×: <span style={{color:'#a090d0'}}>{latticeSpeedMult.toFixed(2)}</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={0.25} max={3.0} step={0.05} value={latticeSpeedMult}
+                  onChange={e => { const v = +e.target.value; setLatticeSpeedMultState(v); setLatticeSpeedMult(v) }} />
+                <div style={{fontSize:11, color:'#888', marginTop:6, marginBottom:2}}>Reint bonds N: <span style={{color:'#a090d0'}}>{reintBondN}</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={1} max={6} step={1} value={reintBondN}
+                  onChange={e => { const v = +e.target.value; setReintBondNState(v); setReintBondN(v) }} />
+                <div style={{fontSize:11, color:'#888', marginTop:6, marginBottom:2}}>Reint frames M: <span style={{color:'#a090d0'}}>{reintFrameM}</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={5} max={120} step={5} value={reintFrameM}
+                  onChange={e => { const v = +e.target.value; setReintFrameMState(v); setReintFrameM(v) }} />
+                <div style={{fontSize:11, color:'#888', marginTop:6, marginBottom:2}}>Visual scale: <span style={{color:'#a090d0'}}>{visualScale.toFixed(1)}×</span></div>
+                <input type="range" style={{width:'100%', accentColor:'#8070c0', cursor:'pointer'}}
+                  min={0.5} max={10.0} step={0.25} value={visualScale}
+                  onChange={e => { const v = +e.target.value; setVisualScaleState(v); setVisualScale(v) }} />
+                <label style={{display:'flex', alignItems:'center', gap:4, fontSize:11, color:'rgba(255,255,255,0.42)', cursor:'pointer', marginTop:6, userSelect:'none'}}>
+                  <input type="checkbox" checked={bondNums} onChange={e => setBondNums(e.target.checked)} style={{accentColor:'#8070c0', cursor:'pointer'}} />
+                  Bond #s
+                </label>
+              </>}
+              {tab === 'glass' && <>
+                {[
+                  ['Z1 end', zone1End, '°', 100,700, 25, onZone1EndChange],
+                  ['Z2 end', zone2End, '°', 400,1100,25, onZone2EndChange],
+                  ['Rate Z1', zone1Rate, '×', 0.5,5.0,0.1, onZone1RateChange],
+                  ['Rate Z2', zone2Rate, '×', 0.05,1.0,0.05, onZone2RateChange],
+                  ['Rate Z3', zone3Rate, '×', 0.5,3.0,0.1, onZone3RateChange],
+                  ['Base', baseEnergyRate, '°/s', 50,600,25, onBaseRateChange],
+                ].map(([label, val, unit, mn, mx, st, cb]) => (
+                  <div key={label}>
+                    <div style={{fontSize:11, color:'#888', marginBottom:2}}>{label}: <span style={{color:'#a090d0'}}>{typeof val === 'number' && val % 1 !== 0 ? val.toFixed(val < 1 ? 2 : 1) : val}{unit}</span></div>
+                    <input type="range" style={{width:'100%', accentColor:'#c8a060', cursor:'pointer', marginBottom:4}}
+                      min={mn} max={mx} step={st} value={val} onChange={cb} />
+                  </div>
+                ))}
+              </>}
+            </>}
+          </div>
+        )}
+
+        {/* Particle canvas area */}
+        <div className="particle-area">
+          {/* Melt canvas — always mounted so its physics state survives a tab switch
+              and the two tabs can be A/B'd instantly. `active` freezes its stepping
+              and drawing while the Bulk Material tab is showing. */}
+          <div style={{ display: tab==='melt' ? 'flex' : 'none', flexDirection:'column', width:'100%', height:'100%', position:'relative' }}>
+            <CompositionView key="melt"
+              active={tab === 'melt'} resetToken={meltResetToken} coolCommitted={coolLocked}
+              sio2Pct={p.sio2} na2oPct={p.na2o} caoPct={p.cao}
+              sioR0={sioR0} attractK={attractK} attractFalloff={attractFalloff} debug={false}
+              bondNums={bondNums}
+              meltTemp={meltLocalTemp} simSpeed={simSpeed} speedMult={speedMult} coolingMode={coolingMode}
+              onTempUpdate={handleTempUpdate} onEnergyUpdate={handleEnergyUpdate}
+              onBondCounts={handleBondCounts}
+              graphCanvasRef={graphCanvasRef} graphUiRef={graphUiRef} onFrameCost={recordFrameCost} heatRateRef={meltTempRef} timePaused={timeStopped} replayInfoRef={replayInfoRef} historyRun={historyRun} heatLeadSteps={heatLeadSteps}
+              cumulativeEnergyRef={meltCumulativeEnergyRef}
+              graphXMaxRef={graphXMaxRef}
+              replayFrame={replayFrame} onReplayReady={handleReplayReady}
+              darkMode={darkMode} showCharge={showCharge} chargeLite={chargeLite} showField={effectiveShowField} fieldBlur={fieldBlur} interpolate={interpolate} longerCooledBonds={longerCooledBonds}
+              atomColorMode={atomColorMode} showBrokenBonds={showBrokenBonds} showLiveStats={showLiveStats}
+              useEmaStrain={useEmaStrain} hcPlateau={hcPlateau} targetTempLine={gotoTargetTemp}
+              onCatchup={onParticlesCatchup}
+            />
+            {particlesLoading && (
+              <div style={{
+                position:'absolute', inset:0, display:'flex', flexDirection:'column',
+                alignItems:'center', justifyContent:'center', gap:14,
+                background: darkMode ? '#0a0806' : '#e8e3da', zIndex:5,
+              }}>
+                <div style={{
+                  width:34, height:34, borderRadius:'50%',
+                  border:'3px solid rgba(200,140,60,0.25)', borderTopColor:'#e08030',
+                  animation:'glassspin 0.8s linear infinite',
+                }} />
+                <div style={{ fontSize:13, letterSpacing:'0.08em', textTransform:'uppercase', color:'#c8945a' }}>Loading…</div>
+                <style>{`@keyframes glassspin { to { transform: rotate(360deg) } }`}</style>
+              </div>
+            )}
+          </div>
+
+          {/* Glass canvas — always mounted so RAF never restarts */}
+          <div style={{ display: tab==='glass' ? 'flex' : 'none', flexDirection:'column', width:'100%', height:'100%', position:'relative' }}>
+            <canvas ref={boxCanvasRef} style={{ flex:1, width:'100%', display:'block' }} />
+            {/* Catch-up melt runs hidden behind this; it clears when the melt is ready. */}
+            {(boxLoading || genProgress !== null) && (
+              <div style={{
+                position:'absolute', inset:0, display:'flex', flexDirection:'column',
+                alignItems:'center', justifyContent:'center', gap:14,
+                background: darkMode ? '#0a0806' : '#e8e3da', zIndex:5,
+              }}>
+                <div style={{
+                  width:34, height:34, borderRadius:'50%',
+                  border:'3px solid rgba(200,140,60,0.25)', borderTopColor:'#e08030',
+                  animation:'glassspin 0.8s linear infinite',
+                }} />
+                <div style={{ fontSize:13, letterSpacing:'0.08em', textTransform:'uppercase', color:'#c8945a' }}>
+                  {genProgress !== null ? `Generating… ${Math.round(genProgress*100)}%` : 'Loading…'}
+                </div>
+                <style>{`@keyframes glassspin { to { transform: rotate(360deg) } }`}</style>
+              </div>
+            )}
+          </div>
+        </div>
+        {/* Right spacer: matches blob-box visual column below the toolbar */}
+        <div style={{ width:100, flexShrink:0, background:'#050505', borderLeft:'2px solid #4a5e6e' }} />
+      </div>
+
+      {/* ── Bottom status bar: what time is showing (controls live in the toolbar) ── */}
+      <div className="scrub-bar">
+        <span style={{fontSize:10, fontWeight:700, letterSpacing:'0.06em', marginLeft:'auto',
+          color: replayFrameInfo ? 'rgba(144,200,240,0.85)' : timePaused ? 'rgba(230,180,90,0.85)' : 'rgba(120,110,90,0.55)'}}>
+          {replayFrameInfo
+            ? `REPLAY · ${replayFrameInfo.t} °C · ${replayFrame + 1} / ${replayFrameCount}`
+            : timePaused ? 'PAUSED' : 'LIVE'}
+        </span>
+      </div>
+
+      {/* Floating E–T graph */}
+
+    </div>
+  )
+}

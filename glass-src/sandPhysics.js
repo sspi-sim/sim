@@ -1,0 +1,1085 @@
+// sandPhysics.js — granular sand physics for the glass box (state 1)
+// Uses Position-Based Dynamics (PBD): velocity is derived from actual displacement
+// after constraint solving, so settled grains naturally get zero velocity.
+
+import { T as GT } from './glassTemps.js'
+const MELT_SPAN = GT.MELT_FULL - GT.MELT_ONSET  // merge/absorb ramp width (onset → fully molten)
+
+export const GRAIN_R     = 2.25   // average; used for packing layout
+export const GRAIN_R_MIN = 1.6
+export const GRAIN_R_MAX = 3.2
+export const N_GRAINS    = 2250  // max / mixture count; pure sand uses 1800
+
+const GRAVITY          = 900
+const DAMPING_SLOW     = 0.80    // extra damping for near-stationary grains
+const DAMPING_FAST     = 0.97    // light damping for fast-moving grains
+const SPEED_SQ_MAX     = 10 * 10 // speed² above which DAMPING_FAST fully applies
+const WALL_RESTITUTION = 0.18
+const RESOLVE_PASSES   = 10
+
+export const SAND_COLORS = [
+  '#c8a84c', '#b89840', '#c4a050', '#a88838',
+  '#d0b060', '#b49045', '#c09848', '#aa8c3c',
+  '#c2a042', '#bc9c44', '#caa44e', '#b29040',
+]
+
+// ── Spatial grid (typed arrays, rebuilt each pass, no GC) ─────────────────
+const CELL = GRAIN_R_MAX * 2   // fine grid; loop uses ±4 to cover large silicate grains
+
+let _gridW   = 0
+let _gridH   = null
+let _nodeG   = null
+let _nodeNxt = null
+
+function allocGrid(HS) {
+  _gridW   = Math.ceil(2 * HS / CELL) + 2
+  _gridH   = new Int32Array(_gridW * _gridW).fill(-1)
+  _nodeG   = new Int32Array(N_GRAINS)
+  _nodeNxt = new Int32Array(N_GRAINS)
+}
+
+// Packed per-grain arrays for the PBD solve (see stepSandPhysics step 3); grown on demand.
+let _sX = null, _sY = null, _sR = null, _sCT = null, _sRB = null, _sWR = null
+const _FWD_DX = [0, 1, -1, 0, 1], _FWD_DY = [0, 0, 1, 1, 1]   // own, E, SW, S, SE
+let _cellX = null, _cellY = null   // each grain's cell AT grid-build time (forward stencil needs it)
+function rebuildGridXY(X, Y, n, HS) {
+  if (!_gridH) allocGrid(HS)
+  if (!_nodeG || _nodeG.length < n) { _nodeG = new Int32Array(n); _nodeNxt = new Int32Array(n) }
+  if (!_cellX || _cellX.length < n) { _cellX = new Int32Array(Math.max(n, N_GRAINS)); _cellY = new Int32Array(Math.max(n, N_GRAINS)) }
+  _gridH.fill(-1)
+  for (let i = 0; i < n; i++) {
+    const cx = Math.min(_gridW - 1, Math.max(0, (X[i] + HS) / CELL | 0))
+    const cy = Math.min(_gridW - 1, Math.max(0, (Y[i] + HS) / CELL | 0))
+    const k  = cy * _gridW + cx
+    _nodeNxt[i] = _gridH[k]
+    _nodeG[i]   = i
+    _gridH[k]   = i
+    _cellX[i] = cx; _cellY[i] = cy
+  }
+}
+
+function rebuildGrid(grains, HS) {
+  if (!_gridH) allocGrid(HS)   // restored sims skip initSandParticles, so the grid may be unallocated
+  // Grains grow past N_GRAINS as Na blobs add sub-circles; grow the node arrays to match or the
+  // grid silently drops the overflow and later reads undefined grains (crash).
+  if (!_nodeG || _nodeG.length < grains.length) {
+    _nodeG   = new Int32Array(grains.length)
+    _nodeNxt = new Int32Array(grains.length)
+  }
+  _gridH.fill(-1)
+  for (let i = 0; i < grains.length; i++) {
+    const g  = grains[i]
+    const cx = Math.min(_gridW - 1, Math.max(0, (g.x + HS) / CELL | 0))
+    const cy = Math.min(_gridW - 1, Math.max(0, (g.y + HS) / CELL | 0))
+    const k  = cy * _gridW + cx
+    _nodeNxt[i] = _gridH[k]
+    _nodeG[i]   = i
+    _gridH[k]   = i
+  }
+}
+
+const NA_R = 1.5
+
+// ── Init ──────────────────────────────────────────────────────────────────
+// na2oPct: 0–100, drives count of Na micro-grains (circles) mixed into sand.
+// At na2o=30 → ~36% count = ~20% volume (r_na=1.5, r_sand_avg=2.25).
+export function initSandParticles(HS, multiRadius = true, na2oPct = 0, nGrains = 1800) {
+  allocGrid(HS)
+
+  const naCountFrac = na2oPct > 0 ? Math.min(0.70, (na2oPct / 30) * 0.36) : 0
+  const nNa         = Math.round(naCountFrac * nGrains)
+
+  const r      = GRAIN_R
+  // Spread grains to fill ~90% of box height with gaps, staying within walls.
+  // Formula derived by solving: (rows-1)*stepY ≈ 0.9*(2*HS-2r)
+  const boxInner = 2 * HS - r * 2
+  const spread   = Math.max(1.0, Math.sqrt(0.90 * boxInner * boxInner / (nGrains * 2 * r * r * Math.sqrt(3))) * 0.70)
+  const stepX  = r * 2 * spread
+  const stepY  = r * Math.sqrt(3) * spread
+  const cols   = Math.floor((2 * HS - r * 2) / stepX)
+  const startX = -(cols - 1) * stepX / 2
+
+  const grains = []
+  let row = 0
+  while (grains.length < nGrains) {
+    const oddRow  = row % 2
+    const rowCols = oddRow ? cols - 1 : cols
+    const rowX0   = startX + oddRow * stepX * 0.5
+    for (let c = 0; c < rowCols && grains.length < nGrains; c++) {
+      const hex = SAND_COLORS[grains.length % SAND_COLORS.length]
+      grains.push({
+        x: rowX0 + c * stepX, y: HS - r - row * stepY,
+        vx: 0, vy: 0,
+        _px: 0, _py: 0,
+        r:     multiRadius ? GRAIN_R_MIN + Math.random() * (GRAIN_R_MAX - GRAIN_R_MIN) : GRAIN_R,
+        angle: Math.random() * Math.PI,
+        color: hex,
+        _cr: parseInt(hex.slice(1,3), 16),
+        _cg: parseInt(hex.slice(3,5), 16),
+        _cb: parseInt(hex.slice(5,7), 16),
+        type:  'sand',
+      })
+    }
+    row++
+  }
+
+  // Randomly scatter Na grains throughout the full pile so they start mixed
+  if (nNa > 0) {
+    const idx = Array.from({ length: nGrains }, (_, i) => i)
+    for (let i = 0; i < nNa; i++) {
+      const j = i + Math.floor(Math.random() * (nGrains - i))
+      ;[idx[i], idx[j]] = [idx[j], idx[i]]
+      const g = grains[idx[i]]
+      g.type  = 'na'
+      g.r     = NA_R
+      g.color = '#dceef8'
+      g._cr   = 220; g._cg = 238; g._cb = 248
+      g.angle = 0
+    }
+  }
+
+  // Sync _px/_py to initial positions
+  for (const g of grains) { g._px = g.x; g._py = g.y }
+  return grains
+}
+
+// ── Na₂O and silicate grain merging ─────────────────────────────────────
+const SILICATE_MAX_R = 20
+
+// Merge passes used to test EVERY pair (n²/2 ≈ 2.4M at 2200 grains, every frame — ~20 ms at 4×
+// throttle mid-melt). Instead: build the grid once and, per grain, collect partners bi > ai from
+// the cells within reach (own radius + the largest radius present). Same candidate set for any
+// pair that can touch; merges are random per touching pair, so visiting order doesn't matter.
+let _cand = new Int32Array(4096)
+function _prepNear(grains, HS) {
+  rebuildGrid(grains, HS)
+  let rMax = 0
+  for (const g of grains) if (g.r > rMax) rMax = g.r
+  return rMax
+}
+function _nearCandidates(grains, ai, HS, rMax) {
+  const a = grains[ai], reach = Math.ceil((a.r + rMax) / CELL)
+  const acx = Math.min(_gridW - 1, Math.max(0, (a.x + HS) / CELL | 0))
+  const acy = Math.min(_gridW - 1, Math.max(0, (a.y + HS) / CELL | 0))
+  let m = 0
+  for (let cy = Math.max(0, acy - reach); cy <= Math.min(_gridW - 1, acy + reach); cy++) {
+    for (let cx = Math.max(0, acx - reach); cx <= Math.min(_gridW - 1, acx + reach); cx++) {
+      let ni = _gridH[cy * _gridW + cx]
+      while (ni !== -1) {
+        const bi = _nodeG[ni]; ni = _nodeNxt[ni]
+        if (bi <= ai) continue
+        if (m >= _cand.length) { const t = new Int32Array(_cand.length * 2); t.set(_cand); _cand = t }
+        _cand[m++] = bi
+      }
+    }
+  }
+  return m
+}
+// Remove flagged grains in one pass (order kept) — repeated splice() was O(n) per removal.
+function _compactAbsorbed(grains, n) {
+  let w = 0
+  for (let i = 0; i < grains.length; i++) if (!(i < n && _toAbsorb[i])) grains[w++] = grains[i]
+  grains.length = w
+}
+
+let _toAbsorb = new Uint8Array(N_GRAINS)
+
+// Call once per visual frame (not per physics tick).
+// Returns count of merges performed.
+export function mergeSodaGrains(grains, meldProb, HS = 160) {
+  if (meldProb <= 0) return 0
+  const MAX_R = NA_R * 10
+  const n = grains.length
+  if (_toAbsorb.length < n) _toAbsorb = new Uint8Array(n * 2)
+  _toAbsorb.fill(0, 0, n)
+  let merged = 0
+  const rMax = _prepNear(grains, HS)
+
+  for (let ai = 0; ai < n; ai++) {
+    if (_toAbsorb[ai]) continue
+    const a = grains[ai]
+    if (a.type !== 'na') continue
+    const m = _nearCandidates(grains, ai, HS, rMax)
+    for (let c = 0; c < m; c++) {
+      const bi = _cand[c]
+      if (_toAbsorb[bi]) continue
+      const b = grains[bi]
+      if (b.type !== 'na') continue
+      const dx = b.x - a.x, dy = b.y - a.y
+      if (dx * dx + dy * dy >= (a.r + b.r) ** 2) continue  // not touching
+      if (Math.random() >= meldProb) continue
+      const r_new = Math.sqrt(a.r ** 2 + b.r ** 2)
+      if (r_new > MAX_R) continue
+      // Merge b into a — area-weighted position/velocity (2D mass ∝ r²)
+      const va = a.r ** 2, vb = b.r ** 2, vt = va + vb
+      a.x  = (a.x  * va + b.x  * vb) / vt
+      a.y  = (a.y  * va + b.y  * vb) / vt
+      a.vx = (a.vx * va + b.vx * vb) / vt
+      a.vy = (a.vy * va + b.vy * vb) / vt
+      a._px = a.x; a._py = a.y
+      a.r = r_new
+      _toAbsorb[bi] = 1
+      merged++
+    }
+  }
+
+  _compactAbsorbed(grains, n)
+  return merged
+}
+
+// Na + Sand → silicate, and silicate + silicate → silicate.
+// Called once per visual frame. Returns merge count.
+export function mergeSilicateGrains(grains, naSandProb, silSilProb, maxMerges = 5, HS = 160) {
+  if (naSandProb <= 0 && silSilProb <= 0) return 0
+  const n = grains.length
+  if (_toAbsorb.length < n) _toAbsorb = new Uint8Array(n * 2)
+  _toAbsorb.fill(0, 0, n)
+  let merged = 0
+  const rMax = _prepNear(grains, HS)
+
+  for (let ai = 0; ai < n; ai++) {
+    if (merged >= maxMerges) break
+    if (_toAbsorb[ai]) continue
+    const a = grains[ai]
+    const isNa  = a.type === 'na'
+    const isSi  = a.type === 'sand'
+    const isSil = a.type === 'silicate'
+    if (!isNa && !isSi && !isSil) continue
+
+    const m = _nearCandidates(grains, ai, HS, rMax)
+    for (let c = 0; c < m; c++) {
+      const bi = _cand[c]
+      if (_toAbsorb[bi]) continue
+      const b = grains[bi]
+
+      let prob = 0
+      if (naSandProb > 0 && ((isNa && b.type === 'sand') || (isSi && b.type === 'na') || (isSil && b.type === 'sand') || (isSi && b.type === 'sand'))) {
+        // sand+sand now merges too: without it, sand grains with only sand neighbours never
+        // coalesce, never reach the blob-convert radius, and drop out of the cooled solid.
+        prob = naSandProb
+      } else if (silSilProb > 0 && isSil && b.type === 'silicate') {
+        prob = silSilProb
+      } else continue
+
+      const dx = b.x - a.x, dy = b.y - a.y
+      if (dx * dx + dy * dy >= (a.r + b.r) ** 2) continue
+      if (Math.random() >= prob) continue
+      const r_new = Math.sqrt(a.r ** 2 + b.r ** 2)
+      if (r_new > SILICATE_MAX_R) continue
+
+      const va = a.r ** 2, vb = b.r ** 2, vt = va + vb
+      a.x  = (a.x  * va + b.x  * vb) / vt
+      a.y  = (a.y  * va + b.y  * vb) / vt
+      a.vx = (a.vx * va + b.vx * vb) / vt
+      a.vy = (a.vy * va + b.vy * vb) / vt
+      a._px = a.x; a._py = a.y
+      a.r = r_new
+      a.type = 'silicate'
+      _toAbsorb[bi] = 1
+      merged++
+      break
+    }
+  }
+
+  _compactAbsorbed(grains, n)
+  return merged
+}
+
+// ── Step ─────────────────────────────────────────────────────────────────
+const LARGE_R = GRAIN_R_MAX * 1.5  // grains above this use linear-scan collision
+
+export function stepSandPhysics(grains, dt, HS, boxAngle, naBlobs = null) {
+  const gx = GRAVITY * Math.sin(boxAngle)
+  const gy = GRAVITY * Math.cos(boxAngle)
+  const n  = grains.length
+  // Cooled-solid blobs (frozen by stepNaBlobSprings below NA_RIGID_TEMP) — see fitRigidNaBlob.
+  let rigid = null, semi = null
+  if (naBlobs) for (const b of naBlobs) { if (b.rb) (rigid ??= []).push(b); else if (b.semi) (semi ??= []).push(b) }
+
+  // 1. Store pre-step positions for velocity derivation
+  for (let i = 0; i < n; i++) {
+    const g = grains[i]; g._px = g.x; g._py = g.y
+  }
+  // Rigid blobs: every orb starts the step on the body's rigid velocity field (v_cm + ω×r), so
+  // the predict step moves the solid as one piece; contacts are then resolved by the shape match.
+  if (rigid) for (const b of rigid) {
+    const rb = b.rb, c = Math.cos(rb.theta), s = Math.sin(rb.theta)
+    rb.pcx = rb.cx; rb.pcy = rb.cy; rb.ptheta = rb.theta
+    for (let i = 0; i < rb.n; i++) {
+      const rx = rb.refX[i] * c - rb.refY[i] * s, ry = rb.refX[i] * s + rb.refY[i] * c
+      b.orbs[i].vx = rb.vx - rb.omega * ry
+      b.orbs[i].vy = rb.vy + rb.omega * rx
+    }
+  }
+
+  // 2. Predict: integrate gravity onto velocity, then position
+  for (let i = 0; i < n; i++) {
+    const g = grains[i]
+    g.vx += gx * dt
+    g.vy += gy * dt
+    g.x  += g.vx * dt
+    g.y  += g.vy * dt
+  }
+
+  // 3. Position-only constraint solve (no velocity changes here).
+  // Runs on packed Float64 arrays (SoA) instead of grain objects: the neighbour loop is ~80% of
+  // the Bulk tab's CPU, and typed-array reads are far cheaper than object property loads. Same
+  // pair order and arithmetic as the object version, so results are identical; positions are
+  // written back for the shape-match passes (rigid/hardening blobs work on orb objects).
+  if (!_sX || _sX.length < n) {
+    const m = Math.max(n, N_GRAINS)
+    _sX = new Float64Array(m); _sY = new Float64Array(m); _sR = new Float64Array(m)
+    _sCT = new Uint8Array(m); _sRB = new Int32Array(m); _sWR = new Float64Array(m)
+  }
+  const X = _sX, Y = _sY, R = _sR, CT = _sCT, RB = _sRB, WR = _sWR
+  let rMax = 0, large = null
+  for (let i = 0; i < n; i++) {
+    const g = grains[i]
+    X[i] = g.x; Y[i] = g.y; R[i] = g.r
+    WR[i] = g.r + wallPad(g)   // wall-contact radius (see _glassWallPad)
+    CT[i] = g.type === 'na-ctr' ? 1 : 0
+    RB[i] = g._rigid ? g.blobId : -1
+    if (g.r > rMax) rMax = g.r
+    if (g.r > LARGE_R) (large ??= []).push(i)
+  }
+  const fits = rigid || semi
+  for (let pass = 0; pass < RESOLVE_PASSES; pass++) {
+    rebuildGridXY(X, Y, n, HS)
+
+    // Forward half-stencil: own cell (each pair once via bi > ai) + the 4 "forward" neighbour cells
+    // (E, SW, S, SE), all pairs. Every unordered neighbour pair is visited exactly once — the old
+    // 9-cell scan visited each twice and discarded one visit (bi <= ai), so this halves the loop.
+    // Cells are the ones assigned at grid-build time (NOT recomputed from the moving position):
+    // otherwise a grain drifting across a cell edge mid-pass can flip the forward/backward
+    // relation and the pair is skipped by both sides.
+    for (let ai = 0; ai < n; ai++) {
+      const acx = _cellX[ai], acy = _cellY[ai]
+      for (let s5 = 0; s5 < 5; s5++) {
+        const cx = acx + _FWD_DX[s5], cy = acy + _FWD_DY[s5]
+        if (cx < 0 || cx >= _gridW || cy >= _gridW) continue
+        const own = s5 === 0
+        let ni = _gridH[cy * _gridW + cx]
+        while (ni !== -1) {
+          const bi = _nodeG[ni]; ni = _nodeNxt[ni]
+          if (own && bi <= ai) continue
+          const dx   = X[bi] - X[ai], dy = Y[bi] - Y[ai]
+          const d2   = dx * dx + dy * dy
+          const minD = R[ai] + R[bi]
+          if (d2 >= minD * minD || d2 < 1e-6) continue
+          if (CT[ai] || CT[bi]) continue
+          if (RB[ai] >= 0 && RB[ai] === RB[bi]) continue   // same solid: no internal contacts
+          const d    = Math.sqrt(d2)
+          const nx   = dx / d, ny = dy / d
+          const push = (minD - d) * 0.5
+          X[ai] -= nx * push; Y[ai] -= ny * push
+          X[bi] += nx * push; Y[bi] += ny * push
+        }
+      }
+    }
+
+    // Large grains (r > CELL/2): the ±1-cell scan above can miss their contacts. Instead of the
+    // old linear scan over EVERY grain (O(n) per large grain per pass, ~18% of the physics), scan
+    // only the grid cells within reach (own radius + the largest radius present).
+    if (large) for (const ai of large) {
+      const reach = Math.ceil((R[ai] + rMax) / CELL)
+      const acx = Math.min(_gridW - 1, Math.max(0, (X[ai] + HS) / CELL | 0))
+      const acy = Math.min(_gridW - 1, Math.max(0, (Y[ai] + HS) / CELL | 0))
+      for (let cy = Math.max(0, acy - reach); cy <= Math.min(_gridW - 1, acy + reach); cy++) {
+        for (let cx = Math.max(0, acx - reach); cx <= Math.min(_gridW - 1, acx + reach); cx++) {
+          let ni = _gridH[cy * _gridW + cx]
+          while (ni !== -1) {
+            const bi = _nodeG[ni]; ni = _nodeNxt[ni]
+            if (bi <= ai) continue
+            const dx = X[bi] - X[ai], dy = Y[bi] - Y[ai]
+            const d2 = dx * dx + dy * dy
+            const minD = R[ai] + R[bi]
+            if (d2 >= minD * minD || d2 < 1e-6) continue
+            const d = Math.sqrt(d2)
+            const nx = dx / d, ny = dy / d
+            const push = (minD - d) * 0.5
+            X[ai] -= nx * push; Y[ai] -= ny * push
+            X[bi] += nx * push; Y[bi] += ny * push
+          }
+        }
+      }
+    }
+
+    for (let i = 0; i < n; i++) {
+      const hi = HS - WR[i]
+      if (X[i] < -hi) X[i] = -hi
+      if (X[i] >  hi) X[i] =  hi
+      if (Y[i] < -hi) Y[i] = -hi
+      if (Y[i] >  hi) Y[i] =  hi
+    }
+
+    // Shape-match every rigid blob at the end of each pass, so the NEXT pass already sees the
+    // solid's corrected pose — contacts push the whole body rather than denting it. These work on
+    // orb objects, so sync positions out and back around them.
+    if (fits) {
+      for (let i = 0; i < n; i++) { grains[i].x = X[i]; grains[i].y = Y[i] }
+      if (rigid) for (const b of rigid) fitRigidNaBlob(b, HS)
+      if (semi)  for (const b of semi)  hardenNaBlob(b)   // partial shape match while hardening
+      for (let i = 0; i < n; i++) { X[i] = grains[i].x; Y[i] = grains[i].y }
+    }
+  }
+  for (let i = 0; i < n; i++) { grains[i].x = X[i]; grains[i].y = Y[i] }
+
+  // 4. Derive velocity from total displacement; apply wall restitution + damping.
+  //    A settled grain barely moves → derived velocity ≈ 0, no damping needed.
+  for (let i = 0; i < n; i++) {
+    const g = grains[i]
+    g.vx = (g.x - g._px) / dt
+    g.vy = (g.y - g._py) / dt
+    // Wall restitution on grains that came to rest at a wall
+    const hi = HS - WR[i]
+    if (g.x <= -hi + 0.05 && g.vx < 0) g.vx *= -WALL_RESTITUTION
+    if (g.x >=  hi - 0.05 && g.vx > 0) g.vx *= -WALL_RESTITUTION
+    if (g.y <= -hi + 0.05 && g.vy < 0) g.vy *= -WALL_RESTITUTION
+    if (g.y >=  hi - 0.05 && g.vy > 0) g.vy *= -WALL_RESTITUTION
+    // Velocity-dependent damping (carry-over to next step)
+    const t = Math.min(1, (g.vx * g.vx + g.vy * g.vy) / SPEED_SQ_MAX)
+    const d0 = DAMPING_SLOW + (DAMPING_FAST - DAMPING_SLOW) * t
+    const d  = g._hard ? d0 + (1 - d0) * g._hard : d0   // hardening blob orbs: damping fades → falls like a solid
+    g.vx *= d
+    g.vy *= d
+  }
+
+  // Rigid blobs: velocity from the body's own pose change this step (no slow-grain damping — that
+  // is what made the cooled glass drift down instead of fall), then the orbs follow that field.
+  if (rigid) for (const b of rigid) {
+    const rb = b.rb
+    let dTh = rb.theta - rb.ptheta
+    if (dTh >  Math.PI) dTh -= 2 * Math.PI
+    if (dTh < -Math.PI) dTh += 2 * Math.PI
+    rb.vx = (rb.cx - rb.pcx) / dt * RB_DAMP_LIN
+    rb.vy = (rb.cy - rb.pcy) / dt * RB_DAMP_LIN
+    rb.omega = dTh / dt * RB_DAMP_ROT
+    const spd = Math.hypot(rb.vx, rb.vy)
+    if (spd > RB_MAX_SPEED) { rb.vx *= RB_MAX_SPEED / spd; rb.vy *= RB_MAX_SPEED / spd }
+    rb.omega = Math.max(-RB_MAX_OMEGA, Math.min(RB_MAX_OMEGA, rb.omega))
+    const c = Math.cos(rb.theta), s = Math.sin(rb.theta)
+    for (let i = 0; i < rb.n; i++) {
+      const rx = rb.refX[i] * c - rb.refY[i] * s, ry = rb.refX[i] * s + rb.refY[i] * c
+      b.orbs[i].vx = rb.vx - rb.omega * ry
+      b.orbs[i].vy = rb.vy + rb.omega * rx
+    }
+    const ctr = b.particles[0]
+    if (ctr && ctr.type === 'na-ctr') { ctr.vx = rb.vx; ctr.vy = rb.vy }
+  }
+
+  // Hardening blobs: the remembered shape creeps toward the current one (plastic flow, fading out).
+  if (semi) for (const b of semi) creepNaBlob(b)
+
+  // Pin every soft blob's phantom centre to its orbs' centre of mass. The centre never collides,
+  // and a MERGED blob has no springs holding it, so it used to fall through everything to the
+  // wall (measured ~95 px off the real blob). absorbNearbyGrains' pre-cull and checkNaBlobMerges'
+  // contact test both measure from it, so touching grains were never absorbed and touching blobs
+  // never merged. (Rigid blobs are already pinned by fitRigidNaBlob.)
+  if (naBlobs) for (const b of naBlobs) {
+    if (b.rb) continue
+    const orbs = b.orbs, ctr = b.particles[0]
+    if (!orbs || !orbs.length || !ctr || ctr.type !== 'na-ctr') continue
+    let cx = 0, cy = 0, vx = 0, vy = 0
+    for (const p of orbs) { cx += p.x; cy += p.y; vx += p.vx; vy += p.vy }
+    const k = 1 / orbs.length
+    ctr.x = cx * k; ctr.y = cy * k; ctr.vx = vx * k; ctr.vy = vy * k
+    ctr._px = ctr.x; ctr._py = ctr.y
+  }
+}
+
+// ── Na₂O blob system ──────────────────────────────────────────────────────
+// When enough Na grains merge they exceed NA_BLOB_CONVERT_R, at which point
+// we replace the single merged circle with a hex-packed soft body.
+
+export const NA_BLOB_R_CTR     = 1.0   // phantom center — never collides
+export const NA_BLOB_CONVERT_R = 5.0   // Na grain radius that triggers conversion
+const NA_BLOB_K_RAD  = 200
+const NA_BLOB_K_NBR  = 100
+const NA_BLOB_PITCH  = NA_R * 2 + 0.4  // hex grid spacing for sub-circles
+
+let _blobId = 0
+
+function hexPackBlob(blobR) {
+  const r       = NA_R
+  const spacing = NA_BLOB_PITCH
+  const rowH    = spacing * Math.sqrt(3) * 0.5
+  const innerR  = blobR - r
+  if (innerR <= 0) return [[0, 0]]
+  const rows = Math.ceil(innerR / rowH)
+  const cols = Math.ceil(innerR / spacing)
+  const out  = []
+  for (let row = -rows; row <= rows; row++) {
+    const y    = row * rowH
+    const xOff = Math.abs(row) % 2 === 1 ? spacing * 0.5 : 0
+    for (let col = -cols; col <= cols; col++) {
+      const x = col * spacing + xOff
+      if (x * x + y * y <= innerR * innerR) out.push([x, y])
+    }
+  }
+  return out
+}
+
+export function makeNaBlob(cx, cy, vx, vy, blobR) {
+  const id  = _blobId++
+  const ctr = {
+    x: cx, y: cy, vx, vy, _px: cx, _py: cy,
+    r: NA_BLOB_R_CTR, type: 'na-ctr', blobId: id,
+    angle: 0, color: '#fff', _cr: 255, _cg: 255, _cb: 255,
+  }
+  const orbs = hexPackBlob(blobR).map(([ox, oy]) => ({
+    x: cx + ox, y: cy + oy, vx, vy, _px: cx + ox, _py: cy + oy,
+    r: NA_R, type: 'na-sub', blobId: id,
+    angle: 0, color: '#fff', _cr: 255, _cg: 255, _cb: 255,
+  }))
+  const particles = [ctr, ...orbs]
+
+  const springs = []
+  for (let k = 1; k < particles.length; k++) {
+    const p = particles[k]
+    const dx = p.x - cx, dy = p.y - cy
+    springs.push({ a: ctr, b: particles[k], rest: Math.sqrt(dx * dx + dy * dy) || 0.001, k: NA_BLOB_K_RAD })
+  }
+  const thresh2 = (NA_BLOB_PITCH * 1.5) ** 2
+  for (let i = 1; i < particles.length; i++) {
+    for (let j = i + 1; j < particles.length; j++) {
+      const dx = particles[j].x - particles[i].x, dy = particles[j].y - particles[i].y
+      const d2 = dx * dx + dy * dy
+      if (d2 < thresh2) springs.push({ a: particles[i], b: particles[j], rest: Math.sqrt(d2), k: NA_BLOB_K_NBR })
+    }
+  }
+
+  return { id, blobR, particles, springs, orbs }
+}
+
+// ── Cooled-solid Na₂O blobs: true rigid bodies (v2 glassPhysics freeze, ported to PBD) ──
+// Below NA_RIGID_TEMP a blob stops being a spring soft-body. Its shape is frozen (each orb's
+// offset from the CM, like v2's freezeParticles) and every PBD pass ends with a SHAPE MATCH:
+// fit the best rigid translation + rotation to wherever contacts pushed the orbs, then snap all
+// orbs onto it. A push on one edge therefore moves/turns the whole solid instead of denting it —
+// zero deformation — and the body falls at full gravity (no per-step velocity kill).
+// Hardening is GRADUAL above that: between _naHardenTemp (900 °C) and _naRigidTemp (500 °C) each blob
+// is pulled partway toward a remembered shape every PBD pass (partial shape matching), with the
+// pull ramping 0 → 1 and the remembered shape "creeping" after the current one (plastic flow)
+// less and less as it cools — viscous melt → stiff glass → (≤500) true rigid body. Dev panel.
+export const NA_RIGID_TEMP = 500
+let _naRigidTemp  = NA_RIGID_TEMP
+let _naHardenTemp = 900
+export const setNaRigidTemp  = v => { _naRigidTemp = v }
+export const setNaHardenTemp = v => { _naHardenTemp = v }
+// The drawn blob outline (thresholded metaball halo: an r×8 sprite per orb, alpha > 64) sits
+// 12–22 px OUTSIDE the outermost orb edges (measured; absorbed grains become orbs with r up to 4, and
+// their halos reach further). The walls used to stop orb edges, so a solid blob's visible edge ran
+// up to ~20 px past the box wall and was clipped flat there — read as the glass squashing into it.
+//  · rigid (≤ rigid temp): wall contact uses the blob's ACTUAL drawn outline — its convex hull,
+//    computed once at freeze from the same halo field the renderer thresholds (visualHull) — with
+//    torque, so the visible edge is exactly what lands on the wall and tips the body.
+//  · hardening: each orb stops _glassWallPadK × r short of the walls, ramped in with hardness (0
+//    above the hardening onset), so hot liquid — and grain absorption at the walls — is unchanged.
+// Dev panel.
+let _glassWallPadK = 7   // the halo reaches 8r from an orb centre = 7r past its edge
+export const setGlassWallPad = v => { _glassWallPadK = v }
+const wallPad = g => g._hard && !g._rigid ? _glassWallPadK * g.r * g._hard : 0
+const HALO_K = 8, HALO_THRESH = 64 / 255   // must match the renderer's halo sprite size + alpha threshold
+const haloAlpha = t => t < 0.3 ? 1 - 0.35 * t / 0.3 : 0.65 * (1 - (t - 0.3) / 0.7)   // sprite's gradient stops
+// Convex hull (body frame, about the CM) of the thresholded halo field of the orbs — what the Bulk
+// renderer draws as the blob's outline. 1 px field; per row, the outermost on-pixels feed a
+// monotone-chain hull.
+function visualHull(orbs, cx, cy) {
+  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity
+  for (const p of orbs) {
+    const R = p.r * HALO_K
+    x0 = Math.min(x0, p.x - R); x1 = Math.max(x1, p.x + R); y0 = Math.min(y0, p.y - R); y1 = Math.max(y1, p.y + R)
+  }
+  x0 = Math.floor(x0); y0 = Math.floor(y0)
+  const W = Math.ceil(x1) - x0 + 1, H = Math.ceil(y1) - y0 + 1
+  const F = new Float32Array(W * H)
+  for (const p of orbs) {
+    const R = p.r * HALO_K, px = p.x - x0, py = p.y - y0
+    const ia = Math.max(0, Math.floor(px - R)), ib = Math.min(W - 1, Math.ceil(px + R))
+    const ja = Math.max(0, Math.floor(py - R)), jb = Math.min(H - 1, Math.ceil(py + R))
+    for (let j = ja; j <= jb; j++) {
+      const dy = j + 0.5 - py
+      for (let i = ia; i <= ib; i++) {
+        const dx = i + 0.5 - px, t = Math.sqrt(dx * dx + dy * dy) / R
+        if (t < 1) F[j * W + i] += haloAlpha(t)
+      }
+    }
+  }
+  const pts = []
+  for (let j = 0; j < H; j++) {
+    let a = -1, b = -1
+    for (let i = 0; i < W; i++) if (F[j * W + i] > HALO_THRESH) { if (a < 0) a = i; b = i }
+    if (a < 0) continue
+    const y = y0 + j - cy
+    pts.push([x0 + a - cx, y], [x0 + b + 1 - cx, y], [x0 + a - cx, y + 1], [x0 + b + 1 - cx, y + 1])
+  }
+  pts.sort((p, q) => p[0] - q[0] || p[1] - q[1])
+  const cr = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+  const lo = [], hi = []
+  for (const q of pts) { while (lo.length > 1 && cr(lo[lo.length - 2], lo[lo.length - 1], q) <= 0) lo.pop(); lo.push(q) }
+  for (let k = pts.length - 1; k >= 0; k--) { const q = pts[k]; while (hi.length > 1 && cr(hi[hi.length - 2], hi[hi.length - 1], q) <= 0) hi.pop(); hi.push(q) }
+  const hull = lo.slice(0, -1).concat(hi.slice(0, -1))
+  return { hx: Float32Array.from(hull, q => q[0]), hy: Float32Array.from(hull, q => q[1]) }
+}
+const SEMI_CREEP_MAX = 0.08   // per step: how fast the remembered shape follows the current one at the soft end
+const naHardness = temp => {  // 0 at/above _naHardenTemp → 1 at _naRigidTemp (smoothstep)
+  const u = Math.max(0, Math.min(1, (_naHardenTemp - temp) / Math.max(1, _naHardenTemp - _naRigidTemp)))
+  return u * u * (3 - 2 * u)
+}
+// Remembered shape for a hardening blob: orb offsets from the CM in the blob's own (unrotated) frame.
+function initSemiNaBlob(blob) {
+  const o = blob.orbs, n = o.length
+  let cx = 0, cy = 0; for (const p of o) { cx += p.x; cy += p.y }; cx /= n; cy /= n
+  const refX = new Float32Array(n), refY = new Float32Array(n)
+  for (let i = 0; i < n; i++) { refX[i] = o[i].x - cx; refY[i] = o[i].y - cy }
+  blob.semi = { n, refX, refY, alpha: 0, beta: 0, creep: 0 }
+}
+// Best-fit pose (CM + rotation) of the orbs against a reference shape — shared by rigid + hardening.
+function fitPose(orbs, n, refX, refY) {
+  let cx = 0, cy = 0
+  for (let i = 0; i < n; i++) { cx += orbs[i].x; cy += orbs[i].y }
+  cx /= n; cy /= n
+  let sc = 0, ss = 0
+  for (let i = 0; i < n; i++) {
+    const qx = orbs[i].x - cx, qy = orbs[i].y - cy
+    sc += refX[i] * qx + refY[i] * qy
+    ss += refX[i] * qy - refY[i] * qx
+  }
+  return { cx, cy, th: (sc === 0 && ss === 0) ? 0 : Math.atan2(ss, sc) }
+}
+// One partial shape-match pass: move each orb β of the way toward its place in the best-fit
+// remembered shape (β per pass compounds to α per step over the solver's passes).
+function hardenNaBlob(blob) {
+  const S = blob.semi, o = blob.orbs
+  if (!S || S.beta <= 0 || S.n !== o.length) return
+  const { cx, cy, th } = fitPose(o, S.n, S.refX, S.refY)
+  const c = Math.cos(th), s = Math.sin(th)
+  for (let i = 0; i < S.n; i++) {
+    const gx = cx + S.refX[i] * c - S.refY[i] * s, gy = cy + S.refX[i] * s + S.refY[i] * c
+    o[i].x += (gx - o[i].x) * S.beta
+    o[i].y += (gy - o[i].y) * S.beta
+  }
+}
+// Plastic creep: the remembered shape drifts toward the current (un-rotated) one.
+function creepNaBlob(blob) {
+  const S = blob.semi, o = blob.orbs
+  if (!S || S.creep <= 0 || S.n !== o.length) return
+  const { cx, cy, th } = fitPose(o, S.n, S.refX, S.refY)
+  const c = Math.cos(-th), s = Math.sin(-th)
+  for (let i = 0; i < S.n; i++) {
+    const qx = o[i].x - cx, qy = o[i].y - cy
+    S.refX[i] += (qx * c - qy * s - S.refX[i]) * S.creep
+    S.refY[i] += (qx * s + qy * c - S.refY[i]) * S.creep
+  }
+}
+const RB_DAMP_LIN  = 0.9995   // per step — near-frictionless, like v2
+const RB_DAMP_ROT  = 0.995    // per step — slight rotational drag
+const RB_MAX_SPEED = 1200     // px/s hard cap (v2)
+const RB_MAX_OMEGA = 14       // rad/s hard cap (v2)
+
+function freezeNaBlob(blob) {
+  const orbs = blob.orbs, n = orbs.length
+  let cx = 0, cy = 0, vx = 0, vy = 0
+  for (const p of orbs) { cx += p.x; cy += p.y; vx += p.vx; vy += p.vy }
+  cx /= n; cy /= n; vx /= n; vy /= n
+  const refX = new Float32Array(n), refY = new Float32Array(n)
+  let I = 0, L = 0
+  for (let i = 0; i < n; i++) {
+    const p = orbs[i]
+    refX[i] = p.x - cx; refY[i] = p.y - cy
+    I += refX[i] * refX[i] + refY[i] * refY[i]
+    L += refX[i] * (p.vy - vy) - refY[i] * (p.vx - vx)
+    p._rigid = true
+  }
+  const { hx, hy } = visualHull(orbs, cx, cy)
+  blob.rb = { n, refX, refY, cx, cy, theta: 0, vx, vy, omega: I > 0 ? L / I : 0, pcx: cx, pcy: cy, ptheta: 0, I, hx, hy }
+  // Re-rest the springs at the frozen shape so a later reheat starts soft from THIS shape
+  // instead of snapping back toward the hex pack the blob was created with.
+  for (const s of blob.springs) s.rest = Math.hypot(s.b.x - s.a.x, s.b.y - s.a.y) || 0.001
+}
+
+function thawNaBlob(blob) {
+  const rb = blob.rb
+  // Hand the rigid velocity field back to the orbs so the soft body continues the motion.
+  const c = Math.cos(rb.theta), s = Math.sin(rb.theta)
+  for (let i = 0; i < blob.orbs.length; i++) {
+    const p = blob.orbs[i]; p._rigid = false
+    if (i >= rb.n) continue
+    const rx = rb.refX[i] * c - rb.refY[i] * s, ry = rb.refX[i] * s + rb.refY[i] * c
+    p.vx = rb.vx - rb.omega * ry; p.vy = rb.vy + rb.omega * rx
+  }
+  blob.rb = null
+}
+
+// Shape match: best-fit rigid pose (CM + rotation) of the orbs vs the frozen reference, then
+// place every orb exactly on it. Equal-mass orbs, so the fit is the 2D Procrustes rotation.
+function fitRigidNaBlob(blob, HS) {
+  const rb = blob.rb, orbs = blob.orbs, n = rb.n
+  let cx = 0, cy = 0
+  for (let i = 0; i < n; i++) { cx += orbs[i].x; cy += orbs[i].y }
+  cx /= n; cy /= n
+  let sc = 0, ss = 0
+  for (let i = 0; i < n; i++) {
+    const qx = orbs[i].x - cx, qy = orbs[i].y - cy
+    sc += rb.refX[i] * qx + rb.refY[i] * qy
+    ss += rb.refX[i] * qy - rb.refY[i] * qx
+  }
+  let th = (sc === 0 && ss === 0) ? rb.theta : Math.atan2(ss, sc)
+  // Wall contact on the DRAWN outline (rb.hx/hy, see visualHull): a few Gauss–Seidel sweeps of
+  // rigid-body position corrections — each penetrating hull vertex pushes the CM and turns the body
+  // by its lever arm (unit-mass orbs, I = Σ|ref|²), so a body landing on a corner tips over. The
+  // pose change becomes the body's velocity (stepSandPhysics §4).
+  const hx = rb.hx, hy = rb.hy, m = hx.length, I = rb.I || 1
+  for (let it = 0; it < 4; it++) {
+    let any = false
+    for (let k = 0; k < m; k++) {
+      const c = Math.cos(th), s = Math.sin(th)
+      const rx = hx[k] * c - hy[k] * s, ry = hx[k] * s + hy[k] * c
+      const wx = cx + rx, wy = cy + ry
+      let nx = 0, ny = 0, pen = 0
+      if (wx < -HS)      { nx =  1; pen = -HS - wx }
+      else if (wx >  HS) { nx = -1; pen =  wx - HS }
+      if (pen > 0) {
+        const rxn = rx * ny - ry * nx, lam = pen / (1 / n + rxn * rxn / I)
+        cx += nx * lam / n; cy += ny * lam / n; th += rxn * lam / I; any = true
+      }
+      const wy2 = cy + hx[k] * Math.sin(th) + hy[k] * Math.cos(th), ry2 = wy2 - cy
+      const rx2 = hx[k] * Math.cos(th) - hy[k] * Math.sin(th)
+      nx = 0; ny = 0; pen = 0
+      if (wy2 < -HS)      { ny =  1; pen = -HS - wy2 }
+      else if (wy2 >  HS) { ny = -1; pen =  wy2 - HS }
+      if (pen > 0) {
+        const rxn = rx2 * ny - ry2 * nx, lam = pen / (1 / n + rxn * rxn / I)
+        cx += nx * lam / n; cy += ny * lam / n; th += rxn * lam / I; any = true
+      }
+    }
+    if (!any) break
+  }
+  const c = Math.cos(th), s = Math.sin(th)
+  // Guarantee: whatever the sweeps left over, translate the CM so no hull vertex is past a wall.
+  let pushL = 0, pushR = 0, pushT = 0, pushB = 0
+  for (let k = 0; k < m; k++) {
+    const wx = cx + hx[k] * c - hy[k] * s, wy = cy + hx[k] * s + hy[k] * c
+    if (wx < -HS) pushL = Math.max(pushL, -HS - wx)
+    if (wx >  HS) pushR = Math.max(pushR,  wx - HS)
+    if (wy < -HS) pushT = Math.max(pushT, -HS - wy)
+    if (wy >  HS) pushB = Math.max(pushB,  wy - HS)
+  }
+  cx += pushL - pushR; cy += pushT - pushB
+  for (let i = 0; i < n; i++) {
+    orbs[i].x = cx + rb.refX[i] * c - rb.refY[i] * s
+    orbs[i].y = cy + rb.refX[i] * s + rb.refY[i] * c
+  }
+  const ctr = blob.particles[0]
+  if (ctr && ctr.type === 'na-ctr') { ctr.x = cx; ctr.y = cy }
+  rb.cx = cx; rb.cy = cy; rb.theta = th
+}
+
+export function stepNaBlobSprings(naBlobs, dt, boxAngle = 0, temp = 1000) {
+  const gx = Math.sin(boxAngle)
+  const gy = Math.cos(boxAngle)
+
+  // v2-style continuous stiffening: both factors are cubic in (1-t)
+  // so they're near-zero above ~800°C and ramp sharply below 400°C.
+  const tFull     = Math.max(0, Math.min(1, (temp - 25) / (GT.MELT_FULL - 25)))
+  const velDamp   = 0.15 * Math.pow(1 - tFull, 3)  // inertia kill per step (soft body only)
+  const rigidFrac = 0.90 * Math.pow(1 - tFull, 3)  // projection toward CM velocity (soft body only)
+  // Below rigidT the blob is a true rigid body (freezeNaBlob / fitRigidNaBlob, run inside
+  // stepSandPhysics) — no springs, no velocity kill. Small hysteresis so it can't flicker.
+  const _w     = typeof window !== 'undefined' ? window : {}
+  const rigidT = _naRigidTemp
+  const hard   = naHardness(temp)
+
+  for (const blob of naBlobs) {
+    const orbsR = blob.orbs ?? (blob.orbs = blob.particles.filter(p => p.type === 'na-sub'))
+    if (blob.rb && (temp > rigidT + 15 || blob.rb.n !== orbsR.length)) thawNaBlob(blob)
+    if (temp <= rigidT && orbsR.length > 0) {
+      if (!blob.rb) freezeNaBlob(blob)
+      if (blob.semi) { blob.semi = null; for (const p of orbsR) p._hard = 0 }
+      continue
+    }
+    // Gradual hardening above the rigid temp (see naHardness / hardenNaBlob).
+    if (hard > 0 && orbsR.length >= 3) {
+      if (!blob.semi || blob.semi.n !== orbsR.length) initSemiNaBlob(blob)
+      blob.semi.alpha = hard
+      blob.semi.beta  = 1 - Math.pow(1 - Math.min(0.999, hard), 1 / RESOLVE_PASSES)
+      blob.semi.creep = SEMI_CREEP_MAX * (1 - hard)
+      for (const p of orbsR) p._hard = hard
+    } else if (blob.semi) { blob.semi = null; for (const p of orbsR) p._hard = 0 }
+    for (const s of blob.springs) {
+      const a = s.a, b = s.b
+      const dx = b.x - a.x, dy = b.y - a.y
+      const d  = Math.sqrt(dx * dx + dy * dy) || 0.01
+      const f  = s.k * (d - s.rest)
+      const fx = f * dx / d, fy = f * dy / d
+      a.vx += fx * dt; a.vy += fy * dt
+      b.vx -= fx * dt; b.vy -= fy * dt
+    }
+
+    const orbs = blob.orbs ?? (blob.orbs = blob.particles.filter(p => p.type === 'na-sub'))
+    if (orbs.length < 1) continue
+
+    // Kill inertia — dominant at cold temps, zero at hot
+    const vd = velDamp * (1 - hard)   // fades as the blob hardens — a solid falls freely
+    if (vd > 0) {
+      for (const p of orbs) { p.vx *= (1 - vd); p.vy *= (1 - vd) }
+    }
+
+    // Project toward CM velocity — makes blob move as one rigid piece when cold
+    if (rigidFrac > 0) {
+      let cvx = 0, cvy = 0
+      for (const p of orbs) { cvx += p.vx; cvy += p.vy }
+      cvx /= orbs.length; cvy /= orbs.length
+      for (const p of orbs) {
+        p.vx += (cvx - p.vx) * rigidFrac
+        p.vy += (cvy - p.vy) * rigidFrac
+      }
+    }
+
+    if (orbs.length < 3 || temp < GT.MELT_ONSET) continue
+    let avgSpd = 0
+    for (const p of orbs) avgSpd += Math.hypot(p.vx, p.vy)
+    avgSpd /= orbs.length
+    const settleFactor = Math.max(0, 1 - avgSpd / 1.5)
+    if (settleFactor <= 0) continue
+
+    const ctr = blob.particles[0]
+    for (const p of orbs) {
+      const dx = p.x - ctr.x, dy = p.y - ctr.y
+      const gravComp = dx * gx + dy * gy
+      if (gravComp >= 0) continue
+      const flatK = 0.8 * settleFactor
+      p.vx -= flatK * gravComp * gx * dt
+      p.vy -= flatK * gravComp * gy * dt
+    }
+  }
+}
+
+// Convert at most one eligible silicate grain per call to avoid batch-conversion
+// of many grains in a single frame, which causes a jarring visual volume jump.
+// maxConvert: live callers pass 1 (one conversion per frame, spread over time). The heat-up
+// replay passes a larger number so one coarse pass stands in for many live frames — otherwise
+// the 1-per-call cap throttles the replay and mixed melting never catches up.
+export function convertLargeNaGrains(grains, naBlobs, maxConvert = 1) {
+  let converted = 0
+  for (let i = grains.length - 1; i >= 0 && converted < maxConvert; i--) {
+    const g = grains[i]
+    if (g.type !== 'silicate' || g.r < NA_BLOB_CONVERT_R) continue
+    grains.splice(i, 1)
+    const blob = makeNaBlob(g.x, g.y, g.vx, g.vy, g.r)
+    for (const p of blob.particles) grains.push(p)
+    naBlobs.push(blob)
+    converted++
+  }
+}
+
+// ── Na blob merging (same logic as v5 checkAndDoMerges) ───────────────────
+
+function mergeNaBlobs(b1, b2, grains) {
+  // Remove both old phantom centers from the grains array
+  for (const blob of [b1, b2]) {
+    const ctr = blob.particles.find(p => p.type === 'na-ctr')
+    if (ctr) { const idx = grains.indexOf(ctr); if (idx !== -1) grains.splice(idx, 1) }
+  }
+
+  const allOrbs = [
+    ...b1.particles.filter(p => p.type === 'na-sub'),
+    ...b2.particles.filter(p => p.type === 'na-sub'),
+  ]
+  let cx = 0, cy = 0, avgVx = 0, avgVy = 0
+  for (const p of allOrbs) { cx += p.x; cy += p.y; avgVx += p.vx; avgVy += p.vy }
+  cx /= allOrbs.length; cy /= allOrbs.length; avgVx /= allOrbs.length; avgVy /= allOrbs.length
+
+  const newCtr = {
+    x: cx, y: cy, vx: avgVx, vy: avgVy, _px: cx, _py: cy,
+    r: NA_BLOB_R_CTR, type: 'na-ctr', blobId: _blobId,
+    angle: 0, color: '#fff', _cr: 255, _cg: 255, _cb: 255,
+  }
+  grains.push(newCtr)
+  for (const p of allOrbs) { p.blobId = _blobId; p._rigid = false }   // new blob starts soft
+
+  return {
+    id: _blobId++,
+    blobR: Math.sqrt(b1.blobR ** 2 + b2.blobR ** 2),
+    particles: [newCtr, ...allOrbs],
+    springs: [],
+    merged: true,
+    orbs: allOrbs,
+  }
+}
+
+// Call once per physics tick (inside the accumulator loop).
+// temp controls how many consecutive ticks of contact are required before merge.
+export function checkNaBlobMerges(naBlobs, mct, grains, temp = 1000) {
+  const tempFactor  = Math.max(0.05, Math.min(1, (temp - GT.MELT_ONSET) / MELT_SPAN))
+  const frameTarget = Math.max(5, Math.round(20 / tempFactor))
+
+  let didMerge = false
+  for (let i = 0; i < naBlobs.length && !didMerge; i++) {
+    for (let j = i + 1; j < naBlobs.length && !didMerge; j++) {
+      // numeric pair key (was a template string per pair per step — ~18k strings/step mid-melt)
+      const key = (naBlobs[i].id % 65536) * 65536 + (naBlobs[j].id % 65536)
+      const ctrA = naBlobs[i].particles[0]
+      const ctrB = naBlobs[j].particles[0]
+      const dx = ctrB.x - ctrA.x, dy = ctrB.y - ctrA.y
+      // Only trigger on actual physical contact: surfaces touching = sum of radii
+      const t = naBlobs[i].blobR + naBlobs[j].blobR + 1
+      const close = dx * dx + dy * dy < t * t
+      if (close) {
+        mct[key] = (mct[key] || 0) + 1
+        if (mct[key] >= frameTarget) {
+          naBlobs[i] = mergeNaBlobs(naBlobs[i], naBlobs[j], grains)
+          naBlobs.splice(j, 1)
+          for (const k of Object.keys(mct)) delete mct[k]
+          didMerge = true
+        }
+      } else if (mct[key] > 0) {
+        mct[key]--
+      }
+    }
+  }
+}
+
+// Call once per visual frame. Absorbs nearby na/silicate/sand grains into sil blobs.
+// All types activate at MELT_ONSET; sand is slower (weaker Si-O bond probability).
+// Proximity is checked against the nearest sub-circle, not the phantom center, so
+// grains trapped inside the hull (where the center may have drifted) are caught.
+// maxPerBlob: live callers pass 1 (one absorption per blob per frame). The heat-up replay
+// passes a larger number so one coarse pass absorbs the grains many live frames would — the
+// 1-per-blob cap otherwise throttles the replay and the blobs never grow to the live size.
+export function absorbNearbyGrains(grains, naBlobs, temp, maxPerBlob = 1) {
+  if (!naBlobs.length) return
+  const tempF    = Math.max(0, Math.min(1, (temp - GT.MELT_ONSET) / MELT_SPAN))
+  const naSilProb = tempF * 0.008
+  const sandProb  = tempF * 0.002  // sand dissolves ~4× slower than Na/silicate
+  if (naSilProb <= 0) return
+
+  for (const blob of naBlobs) {
+    let absorbCount = 0
+    const blobOrbs = blob.orbs ?? blob.particles
+    // Pre-cull against the blob's ACTUAL extent (orb bounding box), not a circle of blobR around
+    // its centre: blobR is an area-equivalent radius, so a blob flattened along the floor reaches
+    // well past it, and grains at its ends were culled forever.
+    let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity
+    for (const p of blobOrbs) {
+      if (p.x < x0) x0 = p.x; if (p.x > x1) x1 = p.x
+      if (p.y < y0) y0 = p.y; if (p.y > y1) y1 = p.y
+    }
+    if (x0 === Infinity) continue
+
+    for (let i = grains.length - 1; i >= 0 && absorbCount < maxPerBlob; i--) {
+      const g = grains[i]
+      const isSand  = g.type === 'sand'
+      const isNaSil = g.type === 'na' || g.type === 'silicate'
+      if (!isSand && !isNaSil) continue
+      if (g.type === 'silicate' && g.r >= NA_BLOB_CONVERT_R) continue
+
+      const prob = isSand ? sandProb : naSilProb
+      if (prob <= 0) continue
+
+      // Margin includes the grain's OWN radius — without it a large grain's centre always sits
+      // outside the box even while its edge touches the blob (the r≈10–15 white Na₂O holdouts).
+      const contactR = g.r + NA_R + 3
+      if (g.x < x0 - contactR || g.x > x1 + contactR || g.y < y0 - contactR || g.y > y1 + contactR) continue
+
+      // Check proximity to nearest sub-circle (catches grains inside the hull too)
+      let minD2 = Infinity
+      for (const p of blobOrbs) {
+        if (p.type !== 'na-sub') continue
+        const dx = g.x - p.x, dy = g.y - p.y
+        minD2 = Math.min(minD2, dx * dx + dy * dy)
+        if (minD2 < contactR * contactR) break
+      }
+      if (minD2 >= contactR * contactR) continue
+      if (Math.random() >= prob) continue
+
+      blob.blobR = Math.sqrt(blob.blobR ** 2 + g.r ** 2)
+      if (g.r >= ABSORB_PACK_R) {
+        // Large grain: dissolve it into blob-sized sub-circles (same hex pack as makeNaBlob)
+        // instead of bolting on ONE giant sub-circle, which read as an awkward outgrowth.
+        grains.splice(i, 1)
+        const packed = makeNaBlob(g.x, g.y, g.vx, g.vy, g.r).orbs
+        for (const o of packed) { grains.push(o); addOrbToBlob(blob, o) }
+      } else {
+        g.type = 'na-sub'
+        g.color = '#fff'; g._cr = 255; g._cg = 255; g._cb = 255
+        addOrbToBlob(blob, g)
+      }
+      absorbCount++
+    }
+  }
+}
+
+// Large absorbed grains (r ≥ this) are hex-packed into small sub-circles — see absorbNearbyGrains.
+const ABSORB_PACK_R = 4
+
+function addOrbToBlob(blob, g) {
+  g.blobId = blob.id
+  g._rigid = false
+  blob.particles.push(g)
+  if (blob.orbs) blob.orbs.push(g)
+  if (blob.merged) return   // merged blobs carry no springs (cohesion comes from contacts)
+  const ctr = blob.particles[0]
+  const dx = g.x - ctr.x, dy = g.y - ctr.y
+  blob.springs.push({ a: ctr, b: g, rest: Math.sqrt(dx * dx + dy * dy) || 1, k: NA_BLOB_K_RAD })
+  const thresh2 = (NA_BLOB_PITCH * 1.5) ** 2
+  for (const p of blob.particles) {
+    if (p === g || p.type === 'na-ctr') continue
+    const pdx = p.x - g.x, pdy = p.y - g.y
+    const pd2 = pdx * pdx + pdy * pdy
+    if (pd2 < thresh2) blob.springs.push({ a: g, b: p, rest: Math.sqrt(pd2), k: NA_BLOB_K_NBR })
+  }
+}
+
+// ── Candidate-state snapshots ─────────────────────────────────────────────────
+// Serialize/restore the full sand state (grains + Na blobs) so precomputed "candidate
+// states" at benchmark temperatures can be loaded instantly instead of re-melting. Blob
+// particle/spring references are stored as INDICES into the grain array, so the result is
+// plain JSON (survives localStorage) and rebuilds into a live, identity-correct graph.
+export function snapshotSand(phys) {
+  const grains = phys.sandParticles ?? []
+  const idx = new Map()
+  for (let i = 0; i < grains.length; i++) idx.set(grains[i], i)
+  return {
+    grains: grains.map(g => ({ ...g })),
+    // Springs are NOT stored — they're rebuilt from grain positions on restore (same geometry
+    // as makeNaBlob), which cuts the serialized size roughly in half for a bundled data file.
+    blobs: (phys.naBlobs ?? []).map(b => ({
+      id: b.id, blobR: b.blobR,
+      partIdx: b.particles.map(p => idx.get(p)),
+      orbIdx:  (b.orbs ?? b.particles.filter(p => p.type === 'na-sub')).map(p => idx.get(p)),
+    })),
+    meldCount: phys.meldCount ?? 0,
+    nNaOriginal: phys.nNaOriginal ?? 0,
+    nGrainOriginal: phys.nGrainOriginal ?? grains.length,
+  }
+}
+
+export function restoreSand(snap) {
+  const grains = snap.grains.map(g => ({ ...g, _rigid: false }))   // blobs restore soft; rigid re-freezes if cold
+  const thresh2 = (NA_BLOB_PITCH * 1.5) ** 2
+  const naBlobs = snap.blobs.map(b => {
+    const particles = b.partIdx.map(i => grains[i])
+    const orbs = b.orbIdx.map(i => grains[i])
+    const ctr = particles.find(p => p.type === 'na-ctr') ?? particles[0]
+    const springs = []
+    for (const p of particles) {        // radial springs: centre → each sub-circle
+      if (p === ctr) continue
+      const dx = p.x - ctr.x, dy = p.y - ctr.y
+      springs.push({ a: ctr, b: p, rest: Math.sqrt(dx * dx + dy * dy) || 0.001, k: NA_BLOB_K_RAD })
+    }
+    for (let i = 0; i < orbs.length; i++) {   // neighbour springs between nearby sub-circles
+      for (let j = i + 1; j < orbs.length; j++) {
+        const dx = orbs[j].x - orbs[i].x, dy = orbs[j].y - orbs[i].y
+        const d2 = dx * dx + dy * dy
+        if (d2 < thresh2) springs.push({ a: orbs[i], b: orbs[j], rest: Math.sqrt(d2), k: NA_BLOB_K_NBR })
+      }
+    }
+    if (b.id >= _blobId) _blobId = b.id + 1   // keep future blob ids from colliding
+    return { id: b.id, blobR: b.blobR, particles, springs, orbs }
+  })
+  return {
+    sandParticles: grains, naBlobs, blobMct: {},
+    meldCount: snap.meldCount, nNaOriginal: snap.nNaOriginal, nGrainOriginal: snap.nGrainOriginal,
+  }
+}
