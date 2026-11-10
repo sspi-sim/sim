@@ -4,18 +4,93 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SSPI Simulations</title>
-<!-- The unit 1 (nuclear chemistry) landing page now lives at /chem1/. This
-     redirect keeps every existing link to the bare domain working. Replace it
-     when there is a hub listing more than one unit. -->
-<meta http-equiv="refresh" content="0; url=/chem1/">
-<link rel="canonical" href="/chem1/">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Lexend:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  html, body { width: 100%; height: 100%; background: #000; }
+
+  html, body {
+    width: 100%; height: 100%;
+    background: #000;
+    overflow: hidden;
+    font-family: 'Lexend', system-ui, sans-serif;
+  }
+
+  /* The artwork is LETTERBOXED, never cropped: the SSP logo runs to within 2%
+     of the left and bottom edges, so any crop eats it. The stage holds the
+     image's aspect ratio and the unit list is positioned inside the stage, so
+     the list stays in the artwork's bottom-right corner at every window size
+     instead of drifting off into a black bar. */
+  #stage {
+    position: fixed; inset: 0;
+    margin: auto;
+    aspect-ratio: 1595 / 986;
+    max-width: 100%;
+    max-height: 100%;
+  }
+
+  #bg {
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+    object-fit: fill;      /* the stage already matches the image's ratio */
+    display: block;
+  }
+
+  /* Bottom right of the ARTWORK, clear of the logo in the lower left. */
+  #units {
+    position: absolute;
+    right: 4.2%;
+    bottom: 5.5%;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 1.6%;
+    text-align: right;
+  }
+
+  #units > a, #units > span {
+    display: block;
+    color: rgba(255,255,255,0.93);
+    text-decoration: none;
+    /* Scales with the stage, so the list keeps its proportion to the artwork */
+    font-size: clamp(13px, 1.75cqw, 30px);
+    font-weight: 500;
+    letter-spacing: 0.02em;
+    line-height: 1.25;
+    white-space: nowrap;
+    /* Readable over both the bright sky and the dark ridge */
+    text-shadow: 0 2px 14px rgba(0,0,0,0.85), 0 0 3px rgba(0,0,0,0.9);
+    transition: color 0.18s ease, text-shadow 0.18s ease, transform 0.18s ease;
+  }
+
+  /* inline, so "Unit 1:" stays on the same line as its title */
+  #units .n {
+    display: inline;
+    font-weight: 300;
+    color: rgba(255,255,255,0.62);
+    margin-right: 0.25em;
+  }
+
+  #units > a:hover, #units > a:focus-visible {
+    color: #fff;
+    text-shadow: 0 2px 14px rgba(0,0,0,0.85), 0 0 18px rgba(120,170,255,0.85);
+    transform: translateX(-3px);
+    outline: none;
+  }
+
+  /* Unit 3 has no page yet, so it is listed but not a link. */
+  #units > .pending { color: rgba(255,255,255,0.45); cursor: default; }
 </style>
 </head>
 <body>
-<script>location.replace('/chem1/');</script>
-<noscript><a href="/chem1/" style="color:#fff;font:16px sans-serif;display:block;padding:24px;">Continue to the simulations</a></noscript>
+<div id="stage" style="container-type: inline-size;">
+  <img id="bg" src="/images/hub-bg.jpg" alt="SSP">
+  <nav id="units" aria-label="Units">
+    <a href="/chem1/"><span class="n">Unit 1:</span>Nuclear Interaction</a>
+    <a href="/chem2/"><span class="n">Unit 2:</span>Electrons and Bonds</a>
+    <span class="pending"><span class="n">Unit 3:</span>Concrete and Glass</span>
+  </nav>
+</div>
 </body>
 </html>
