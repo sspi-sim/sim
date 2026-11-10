@@ -4,49 +4,90 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SSPI Simulations — Chemistry Unit 2</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Lexend:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  html, body { width: 100%; height: 100%; background: #000; overflow: hidden; }
+
+  :root {
+    /* Sampled from the hero's own background, so the image has no visible
+       edge against the page. */
+    --bg:   #04020f;
+    --cyan: #3fd0e8;
+    /* Size of the sim list. */
+    --ufs:  clamp(16px, 2.9vw, 52px);
+  }
+
+  html, body {
+    width: 100%; height: 100%;
+    background: var(--bg);
+    overflow: hidden;
+    font-family: 'Lexend', system-ui, sans-serif;
+    color: #fff;
+  }
+
+  body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: clamp(24px, 6vw, 110px);
+    padding: clamp(18px, 4vw, 72px);
+  }
+
+  /* The hero is a single oxygen atom from the electrons sim, left to run so
+     the valence trails fill in. 560x490, with its own edges feathered to the
+     page colour so there is no rectangle against the background. */
+  #hero {
+    flex: 0 0 auto;
+    height: min(82vh, 44vw);
+    width: auto;
+    display: block;
+  }
+
+  #sims {
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    font-size: var(--ufs);
+    gap: 0.62em;
+  }
+
+  #sims a {
+    display: block;
+    color: rgba(255,255,255,0.92);
+    text-decoration: none;
+    font-size: var(--ufs);
+    font-weight: 600;
+    letter-spacing: 0.2em;
+    line-height: 1.25;
+    white-space: nowrap;
+    transition: color 0.18s ease, transform 0.18s ease;
+  }
+
+  #sims a:hover, #sims a:focus-visible {
+    color: var(--cyan);
+    transform: translateX(4px);
+    outline: none;
+  }
+
+  /* Narrow or portrait: stack, hero on top, list centred under it. */
+  @media (max-aspect-ratio: 1/1), (max-width: 760px) {
+    :root { --ufs: clamp(14px, 4.4vw, 34px); }
+    body { flex-direction: column; gap: clamp(16px, 4vh, 44px); }
+    #hero { height: auto; width: min(76vw, 60vh); }
+    #sims { align-items: center; }
+  }
 </style>
 </head>
 <body>
-<!-- The HUD frame is shared with /chem1/ — one copy, served from /nucleus/. -->
-<img id="allBg" src="/nucleus/images/TitleFull.png" alt=""
-     style="position:fixed;inset:0;width:100%;height:100%;object-fit:fill;display:block;">
-<div id="allTitleContainer" style="position:fixed;inset:80px;">
-  <img id="allTitle" src="/chem2/images/TitleText.jpg" alt="Electrons and Bonds"
-       style="width:100%;height:100%;object-fit:contain;display:block;">
-  <!-- Hotspots are percentages of the TITLE IMAGE, not the window, so they are
-       measured off the artwork: each button's yellow outline, as a fraction of
-       the 1486x1059 plate. The script below sizes this box to wherever
-       object-fit:contain actually put the image. -->
-  <div id="allHotspots" style="position:absolute;pointer-events:none;">
-    <a href="/electrons/" aria-label="Electrons" style="position:absolute;pointer-events:all;cursor:pointer;top:39.3%;left:15.2%;width:69.4%;height:12.7%"></a>
-    <a href="/valence/"   aria-label="Valence"   style="position:absolute;pointer-events:all;cursor:pointer;top:55.6%;left:15.2%;width:69.6%;height:12.8%"></a>
-    <a href="/bonds/"     aria-label="Bonds"     style="position:absolute;pointer-events:all;cursor:pointer;top:72.0%;left:15.1%;width:69.7%;height:12.7%"></a>
-  </div>
-</div>
+  <img id="hero" src="/chem2/images/oxygen.jpg" alt="An oxygen atom, its valence electrons traced out as trails">
 
-<script>
-(function() {
-  const IMG_W = 1486, IMG_H = 1059;          // the title plate's own pixels
-  function positionHotspots() {
-    const container = document.getElementById('allTitleContainer');
-    const hotspots  = document.getElementById('allHotspots');
-    if (!container || !hotspots) return;
-    const cw = container.clientWidth, ch = container.clientHeight;
-    const scale = Math.min(cw / IMG_W, ch / IMG_H);
-    const dw = IMG_W * scale, dh = IMG_H * scale;
-    const dx = (cw - dw) / 2, dy = (ch - dh) / 2;
-    hotspots.style.left   = dx + 'px';
-    hotspots.style.top    = dy + 'px';
-    hotspots.style.width  = dw + 'px';
-    hotspots.style.height = dh + 'px';
-  }
-  document.getElementById('allTitle').addEventListener('load', positionHotspots);
-  window.addEventListener('resize', positionHotspots);
-  positionHotspots();
-})();
-</script>
+  <nav id="sims" aria-label="Unit 2 simulations">
+    <a href="/electrons/">ELECTRONS</a>
+    <a href="/valence/">VALENCE</a>
+    <a href="/bonds/">BONDS</a>
+  </nav>
 </body>
 </html>
