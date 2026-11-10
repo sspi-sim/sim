@@ -60,7 +60,7 @@
        artwork's width and ran into the SSP logo, and at 320px it overflowed.
        At 13px the floor only binds below a 413px stage, where it behaves
        exactly as it did before. */
-    font-size: clamp(13px, 3.15cqw, 54px);
+    font-size: clamp(12px, calc(3.15cqw - 1pt), calc(54px - 1pt));
     font-weight: 500;
     letter-spacing: 0.02em;
     line-height: 1.25;
@@ -94,11 +94,11 @@
 <div id="stage" style="container-type: inline-size;">
   <img id="bg" src="/images/hub-bg.jpg" alt="SSP">
   <nav id="units" aria-label="Units">
-    <a href="/chem1/"><span class="n">Unit 1:</span>Nuclear Interaction</a>
-    <a href="/chem2/"><span class="n">Unit 2:</span>Electrons and Bonds</a>
-    <a href="/chem3/"><span class="n">Unit 3:</span>Concrete and Glass</a>
-    <span class="pending"><span class="n">Unit 5:</span><span class="soon">Coming soon</span></span>
-    <span class="pending"><span class="n">Unit 6:</span><span class="soon">Coming soon</span></span>
+    <a href="/chem1/"><span class="n">Unit 1 Models:</span>Nuclear Interactions</a>
+    <a href="/chem2/"><span class="n">Unit 2 Models:</span>Electrons and Bonds</a>
+    <a href="/chem3/"><span class="n">Unit 3 Models:</span>Concrete and Glass</a>
+    <span class="pending"><span class="n">Unit 5 Models:</span><span class="soon">Coming soon</span></span>
+    <span class="pending"><span class="n">Unit 6 Models:</span><span class="soon">Coming soon</span></span>
   </nav>
 </div>
 </body>
