@@ -11,9 +11,12 @@
   * { margin: 0; padding: 0; box-sizing: border-box; }
 
   :root {
-    /* The hero's own dominant background colour, measured from the image
-       (21,727 px of it), so the picture has no edge against the page. */
-    --bg:   #050310;
+    /* Exactly the hero's own background. The hero is grabbed straight off the
+       sim's canvas, whose backdrop is a single flat value — 284,282 of ~290,000
+       sampled border pixels are rgb(5,4,15), with no dither or noise at all — so
+       matching it here makes the picture's edge literally undetectable, with no
+       feathering or pixel surgery needed. */
+    --bg:   #05040f;
     --cyan: #3fd0e8;
     /* Size of the sim list. */
     --ufs:  clamp(16px, 2.9vw, 52px);
@@ -35,9 +38,12 @@
     padding: clamp(18px, 4vw, 72px);
   }
 
-  /* The hero is a single oxygen atom from the electrons sim, left to run so
-     the valence trails fill in. 560x490, with its own edges feathered to the
-     page colour so there is no rectangle against the background. */
+  /* The hero is a single oxygen atom from the electrons sim, left to run so the
+     valence trails fill in. 1520x1520, lifted from the canvas with toDataURL
+     rather than screenshotted: the sim sets canvas.width = window.innerWidth, so
+     it renders at 1 CSS px per pixel and a screen grab can never beat the window.
+     Oversizing the backing store to 1800x1800 and raising viewZoom to suit draws
+     the same atom with 2.7x the pixels, and skips the UI chrome for free. */
   #hero {
     flex: 0 0 auto;
     height: min(82vh, 44vw);
