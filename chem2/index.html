@@ -45,12 +45,10 @@
      Oversizing the backing store to 1800x1800 and raising viewZoom to suit draws
      the same atom with 2.7x the pixels, and skips the UI chrome for free.
 
-     Trail strokes are 6px here against the sim's 1.5px — at this zoom its fixed
-     width goes hairline-thin next to the atom. 6 was picked off a ladder shot at
-     one frozen instant (3/4/5/6/7.5) so the weights were compared on identical
-     geometry; past about 7.5 the orbits stop reading as separate where they cross.
-     Capture-only: scaled on the capture page's 2D context, not in the sim, which
-     still strokes trails at 1.5px for the students using it. */
+     Trail strokes were doubled, 1.5px to 3px, for the capture only — at this zoom
+     the sim's fixed-width line goes hairline-thin next to the atom. That was done
+     by scaling the one value on the capture page's 2D context, not in the sim: the
+     live sim is unchanged and still strokes trails at 1.5px. */
   #hero {
     flex: 0 0 auto;
     height: min(82vh, 44vw);
