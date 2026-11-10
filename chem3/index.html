@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SSPI Simulations — Chemistry Unit 3</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Lexend:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html, body {
+    width: 100%; height: 100%;
+    background: #000;
+    overflow: hidden;
+    font-family: 'Lexend', system-ui, sans-serif;
+  }
+
+  /* The two panels are stacked and the whole stack is letterboxed, so neither
+     image is ever cropped and the labels keep their proportion to the art.
+     The ratio is the stack's: concrete is 1377x692 (1.990), glass is 1492x640
+     (2.331), plus the gap between them —
+       total height = W/1.990 + W/2.331 + 0.022W = 0.9535W  ->  1 / 0.9535 */
+  #stack {
+    position: fixed; inset: 0;
+    margin: auto;
+    aspect-ratio: 1.0488;
+    max-width: 100%;
+    max-height: 100%;
+    container-type: inline-size;
+    display: flex;
+    flex-direction: column;
+    gap: 2.2%;
+  }
+
+  .panel {
+    position: relative;
+    display: block;
+    width: 100%;
+    text-decoration: none;
+    line-height: 0;                 /* no stray inline-image gap */
+    transition: transform 0.2s ease, filter 0.2s ease;
+  }
+
+  .panel img { width: 100%; height: auto; display: block; }
+
+  /* Top centre: the one spot that is clean in BOTH images — uniform cream in
+     the concrete shot, flat dark in the glass one. */
+  .label {
+    position: absolute;
+    top: 5.5%;
+    left: 0; right: 0;
+    text-align: center;
+    font-size: 4.2cqw;
+    font-weight: 600;
+    letter-spacing: 0.22em;
+    line-height: 1;
+    pointer-events: none;
+  }
+
+  .concrete .label { color: #000; }
+  .glass    .label { color: #fff; }
+
+  .panel:hover, .panel:focus-visible {
+    filter: brightness(1.06);
+    transform: translateY(-2px);
+    outline: none;
+  }
+</style>
+</head>
+<body>
+<div id="stack">
+  <a class="panel concrete" href="/concrete/">
+    <img src="/chem3/images/concrete.jpg" alt="Concrete beam under load">
+    <span class="label">CONCRETE</span>
+  </a>
+  <a class="panel glass" href="/glass/">
+    <img src="/chem3/images/glass.jpg" alt="Glass melt">
+    <span class="label">GLASS</span>
+  </a>
+</div>
+</body>
+</html>
