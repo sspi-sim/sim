@@ -45,21 +45,27 @@
 
   .panel img { width: 100%; height: auto; display: block; }
 
-  /* Top centre: the one spot that is clean in BOTH images — uniform cream in
-     the concrete shot, flat dark in the glass one. */
+  /* GLASS sits top centre, on the flat dark area above the two boxes.
+     CONCRETE sits bottom centre — see .concrete .label below. */
   .label {
     position: absolute;
     top: 5.5%;
     left: 0; right: 0;
     text-align: center;
-    font-size: 4.2cqw;
+    font-size: 8.4cqw;              /* 2x */
     font-weight: 600;
     letter-spacing: 0.22em;
     line-height: 1;
     pointer-events: none;
   }
 
-  .concrete .label { color: #000; }
+  /* Bottom of the concrete image. The clean cream strip under the base plate
+     is only the last ~6% of the image, too thin to hold a label this size, so
+     the glyphs overlap the steel plate. That is legible — black on the plate
+     is about 8:1 — but the cartoon's black OUTLINES run through the band at
+     1.6:1, so the label is anchored low to keep most of each glyph in the
+     cream rather than centred in the band. */
+  .concrete .label { color: #000; top: auto; bottom: 2.5%; }
   .glass    .label { color: #fff; }
 
   .panel:hover, .panel:focus-visible {

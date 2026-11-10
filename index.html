@@ -54,7 +54,13 @@
     color: rgba(255,255,255,0.93);
     text-decoration: none;
     /* Scales with the stage, so the list keeps its proportion to the artwork */
-    font-size: clamp(13px, 1.75cqw, 30px);
+    /* 1.8x: the fluid size and the cap are both scaled. The FLOOR is not — it
+       is a legibility minimum, and at 1.8x it stops being a floor and starts
+       driving the layout: on a 390px-wide phone the list hit 83% of the
+       artwork's width and ran into the SSP logo, and at 320px it overflowed.
+       At 13px the floor only binds below a 413px stage, where it behaves
+       exactly as it did before. */
+    font-size: clamp(13px, 3.15cqw, 54px);
     font-weight: 500;
     letter-spacing: 0.02em;
     line-height: 1.25;
