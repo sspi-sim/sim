@@ -101,10 +101,60 @@
     #logo { width: min(86vw, 150vh); height: auto; }
     #units { align-items: center; }
   }
+
+  /* ── Neon layout ──────────────────────────────────────────────────────────
+     The previous landing page, kept as an alternate. Type "neon" to switch;
+     type it again to switch back. The two layouts share one copy of the unit
+     list — the script moves it between the logo row and the artwork. */
+
+  #neon { display: none; }
+
+  body.neon { display: block; padding: 0; background: #000; }
+  body.neon #logo { display: none; }
+
+  body.neon #neon {
+    display: block;
+    position: fixed; inset: 0;
+    margin: auto;
+    aspect-ratio: 1595 / 986;
+    max-width: 100%;
+    max-height: 100%;
+    container-type: inline-size;
+  }
+  body.neon #bg {
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+    object-fit: fill;          /* the box already holds the image's ratio */
+    display: block;
+  }
+
+  body.neon #units {
+    position: absolute;
+    right: 4.2%;
+    bottom: 5.5%;
+    align-items: flex-end;
+    text-align: right;
+    font-size: clamp(12px, calc(3.15cqw - 1pt), calc(54px - 1pt));
+    gap: 1.6%;
+  }
+  body.neon #units > a, body.neon #units > span {
+    font-size: inherit;
+    letter-spacing: 0.02em;
+    /* Readable over both the bright sky and the dark ridge */
+    text-shadow: 0 2px 14px rgba(0,0,0,0.85), 0 0 3px rgba(0,0,0,0.9);
+  }
+  body.neon #units > a:hover, body.neon #units > a:focus-visible {
+    color: #fff;
+    text-shadow: 0 2px 14px rgba(0,0,0,0.85), 0 0 18px rgba(120,170,255,0.85);
+    transform: translateX(-3px);
+  }
+  body.neon #units > .pending { color: rgba(255,255,255,0.42); }
 </style>
 </head>
 <body>
   <img id="logo" src="/images/ssp-logo.png" alt="SSP INTL">
+
+  <div id="neon"><img id="bg" src="" alt=""></div>
 
   <nav id="units" aria-label="Units">
     <a href="/chem1/"><span class="n">Unit 1 Models:</span>Nuclear Interactions</a>
@@ -113,5 +163,40 @@
     <span class="pending"><span class="n">Unit 5 Models:</span><span class="soon">Coming soon</span></span>
     <span class="pending"><span class="n">Unit 6 Models:</span><span class="soon">Coming soon</span></span>
   </nav>
+
+<script>
+(function () {
+  // Type "neon" to switch to the neon layout; type it again to switch back.
+  const WORD  = 'neon';
+  const neon  = document.getElementById('neon');
+  const bg    = document.getElementById('bg');
+  const units = document.getElementById('units');
+  let typed = '';
+
+  function setNeon(on) {
+    if (on === document.body.classList.contains('neon')) return;
+    if (on) {
+      // The artwork is only fetched the first time anyone asks for it, so the
+      // default page never pays for a 353 KB image it does not show.
+      if (!bg.getAttribute('src')) bg.src = '/images/hub-bg.jpg';
+      neon.appendChild(units);          // one list, moved into the artwork
+    } else {
+      document.body.appendChild(units);
+    }
+    document.body.classList.toggle('neon', on);
+  }
+
+  addEventListener('keydown', e => {
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key === 'Escape') { setNeon(false); typed = ''; return; }
+    if (e.key.length !== 1) return;
+    typed = (typed + e.key.toLowerCase()).slice(-WORD.length);
+    if (typed === WORD) {
+      setNeon(!document.body.classList.contains('neon'));
+      typed = '';
+    }
+  });
+})();
+</script>
 </body>
 </html>
