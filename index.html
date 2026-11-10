@@ -14,6 +14,10 @@
     /* Sampled from the logo artwork, so the page and the image are the same
        field of colour and the logo has no visible edge. */
     --bg:     #050e17;
+    /* One size drives both columns: the unit rows use it directly, and the
+       logo's height is derived from it (see #logo), so the logo is always
+       exactly as tall as the list. */
+    --ufs:    clamp(13px, 1.95vw, 36px);
     --teal:   #3fc8c8;
     --blue:   #4a86c8;
   }
@@ -34,12 +38,15 @@
     padding: clamp(18px, 4vw, 72px);
   }
 
-  /* Big, on the left. Capped by height as well as width (the logo is 920x533,
-     ratio 1.726) so it never pushes the list off a short window. */
+  /* On the left, exactly as tall as the list beside it.
+     The list is 5 rows at line-height 1.25 with 4 gaps of 0.55em:
+         5 x 1.25 + 4 x 0.55  =  8.45em
+     of the shared --ufs, so that is the logo's height. Width follows from the
+     image's own 920x533 ratio. */
   #logo {
-    flex: 0 1 auto;
-    width: min(56vw, 124vh);
-    height: auto;
+    flex: 0 0 auto;
+    height: calc(8.45 * var(--ufs));
+    width: auto;
     display: block;
   }
 
@@ -48,6 +55,10 @@
     display: flex;
     flex-direction: column;
     align-items: flex-start;
+    /* The gap is 0.55em, so this element has to carry --ufs itself — otherwise
+       em resolves against the inherited 16px and the list stops matching the
+       logo's derived height. */
+    font-size: var(--ufs);
     gap: 0.55em;
   }
 
@@ -55,7 +66,7 @@
     display: block;
     color: rgba(255,255,255,0.93);
     text-decoration: none;
-    font-size: clamp(13px, 1.95vw, 36px);
+    font-size: var(--ufs);
     font-weight: 500;
     letter-spacing: 0.01em;
     line-height: 1.25;
@@ -82,12 +93,13 @@
   #units > .pending { color: rgba(255,255,255,0.34); cursor: default; }
   #units > .pending .soon { font-weight: 300; font-style: italic; }
 
-  /* Narrow or portrait: stack, logo on top. */
+  /* Narrow or portrait: stack, logo on top. Matching heights makes no sense
+     one above the other, so the logo goes back to being sized by width. */
   @media (max-aspect-ratio: 1/1), (max-width: 760px) {
+    :root { --ufs: clamp(13px, 3.6vw, 30px); }
     body { flex-direction: column; gap: clamp(18px, 4vh, 48px); }
-    #logo { width: min(86vw, 150vh); }
+    #logo { width: min(86vw, 150vh); height: auto; }
     #units { align-items: center; }
-    #units > a, #units > span { font-size: clamp(13px, 3.6vw, 30px); }
   }
 </style>
 </head>
