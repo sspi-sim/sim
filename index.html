@@ -78,6 +78,10 @@
     margin-right: 0.25em;
   }
 
+  /* Units with no page yet: listed, dimmed, and not links. */
+  #units > .pending { color: rgba(255,255,255,0.42); cursor: default; }
+  #units > .pending .soon { font-weight: 300; font-style: italic; }
+
   #units > a:hover, #units > a:focus-visible {
     color: #fff;
     text-shadow: 0 2px 14px rgba(0,0,0,0.85), 0 0 18px rgba(120,170,255,0.85);
@@ -93,6 +97,8 @@
     <a href="/chem1/"><span class="n">Unit 1:</span>Nuclear Interaction</a>
     <a href="/chem2/"><span class="n">Unit 2:</span>Electrons and Bonds</a>
     <a href="/chem3/"><span class="n">Unit 3:</span>Concrete and Glass</a>
+    <span class="pending"><span class="n">Unit 5:</span><span class="soon">Coming soon</span></span>
+    <span class="pending"><span class="n">Unit 6:</span><span class="soon">Coming soon</span></span>
   </nav>
 </div>
 </body>
