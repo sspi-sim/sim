@@ -45,11 +45,16 @@
 
   .panel img { width: 100%; height: auto; display: block; }
 
-  /* GLASS sits top centre, on the flat dark area above the two boxes.
-     CONCRETE sits bottom centre — see .concrete .label below. */
+  /* Each label sits in the middle of its own image's empty band, found by
+     scanning the artwork for rows that are flat and even enough to carry text:
+       concrete — cream, y 46.7%-70.1% (23.6% tall), between the beam and the
+                  base plate. The strip under the plate is only 4.3% tall, far
+                  too thin for a label this size.
+       glass    — dark, y 4.5%-61.4% (57% tall), above the particles and melt.
+     Both labels are centred in their band, so each has clear space above and
+     below rather than crowding an edge. */
   .label {
     position: absolute;
-    top: 5.5%;
     left: 0; right: 0;
     text-align: center;
     font-size: 8.4cqw;              /* 2x */
@@ -59,14 +64,17 @@
     pointer-events: none;
   }
 
-  /* Bottom of the concrete image. The clean cream strip under the base plate
-     is only the last ~6% of the image, too thin to hold a label this size, so
-     the glyphs overlap the steel plate. That is legible — black on the plate
-     is about 8:1 — but the cartoon's black OUTLINES run through the band at
-     1.6:1, so the label is anchored low to keep most of each glyph in the
-     cream rather than centred in the band. */
-  .concrete .label { color: #000; top: auto; bottom: 2.5%; }
-  .glass    .label { color: #fff; }
+  /* Band centre minus half the label's height. The label box is as tall as the
+     font (line-height 1), and the font is a share of the STACK's width, so in
+     panel-height terms it is 8.4% x the panel's own aspect ratio:
+       concrete  8.4 x 1.990 = 16.7% tall  ->  58.4 - 8.35 = 50.0
+       glass     8.4 x 2.331 = 19.6% tall  ->  33.0 - 9.79 = 23.2  */
+  /* Centred on the WHITESPACE, not on the panel: at the label's rows the
+     column and its shadow take the left 25.9%, so a panel-centred label starts
+     at 19.2% and runs onto the column. Boxing it from 25.9% puts the ink at
+     32.1%-93.7%, about 6 points clear on each side. */
+  .concrete .label { color: #000; top: 50.0%; left: 25.9%; }
+  .glass    .label { color: #fff; top: 23.2%; }
 
   .panel:hover, .panel:focus-visible {
     filter: brightness(1.06);
