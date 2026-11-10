@@ -43,7 +43,12 @@
      rather than screenshotted: the sim sets canvas.width = window.innerWidth, so
      it renders at 1 CSS px per pixel and a screen grab can never beat the window.
      Oversizing the backing store to 1800x1800 and raising viewZoom to suit draws
-     the same atom with 2.7x the pixels, and skips the UI chrome for free. */
+     the same atom with 2.7x the pixels, and skips the UI chrome for free.
+
+     Trail strokes were doubled, 1.5px to 3px, for the capture only — at this zoom
+     the sim's fixed-width line goes hairline-thin next to the atom. That was done
+     by scaling the one value on the capture page's 2D context, not in the sim: the
+     live sim is unchanged and still strokes trails at 1.5px. */
   #hero {
     flex: 0 0 auto;
     height: min(82vh, 44vw);
