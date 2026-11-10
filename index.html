@@ -10,89 +10,90 @@
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
 
+  :root {
+    /* Sampled from the logo artwork, so the page and the image are the same
+       field of colour and the logo has no visible edge. */
+    --bg:     #050e17;
+    --teal:   #3fc8c8;
+    --blue:   #4a86c8;
+  }
+
   html, body {
     width: 100%; height: 100%;
-    background: #000;
+    background: var(--bg);
     overflow: hidden;
     font-family: 'Lexend', system-ui, sans-serif;
+    color: #fff;
   }
 
-  /* The artwork is LETTERBOXED, never cropped: the SSP logo runs to within 2%
-     of the left and bottom edges, so any crop eats it. The stage holds the
-     image's aspect ratio and the unit list is positioned inside the stage, so
-     the list stays in the artwork's bottom-right corner at every window size
-     instead of drifting off into a black bar. */
-  #stage {
-    position: fixed; inset: 0;
-    margin: auto;
-    aspect-ratio: 1595 / 986;
-    max-width: 100%;
-    max-height: 100%;
+  body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: clamp(24px, 5vw, 96px);
+    padding: clamp(18px, 4vw, 72px);
   }
 
-  #bg {
-    position: absolute; inset: 0;
-    width: 100%; height: 100%;
-    object-fit: fill;      /* the stage already matches the image's ratio */
+  /* Big, on the left. Capped by height as well as width (the logo is 920x533,
+     ratio 1.726) so it never pushes the list off a short window. */
+  #logo {
+    flex: 0 1 auto;
+    width: min(56vw, 124vh);
+    height: auto;
     display: block;
   }
 
-  /* Bottom right of the ARTWORK, clear of the logo in the lower left. */
   #units {
-    position: absolute;
-    right: 4.2%;
-    bottom: 5.5%;
+    flex: 0 0 auto;
     display: flex;
     flex-direction: column;
-    align-items: flex-end;
-    gap: 1.6%;
-    text-align: right;
+    align-items: flex-start;
+    gap: 0.55em;
   }
 
   #units > a, #units > span {
     display: block;
     color: rgba(255,255,255,0.93);
     text-decoration: none;
-    /* Scales with the stage, so the list keeps its proportion to the artwork */
-    /* 1.8x: the fluid size and the cap are both scaled. The FLOOR is not — it
-       is a legibility minimum, and at 1.8x it stops being a floor and starts
-       driving the layout: on a 390px-wide phone the list hit 83% of the
-       artwork's width and ran into the SSP logo, and at 320px it overflowed.
-       At 13px the floor only binds below a 413px stage, where it behaves
-       exactly as it did before. */
-    font-size: clamp(12px, calc(3.15cqw - 1pt), calc(54px - 1pt));
+    font-size: clamp(13px, 1.95vw, 36px);
     font-weight: 500;
-    letter-spacing: 0.02em;
+    letter-spacing: 0.01em;
     line-height: 1.25;
     white-space: nowrap;
-    /* Readable over both the bright sky and the dark ridge */
-    text-shadow: 0 2px 14px rgba(0,0,0,0.85), 0 0 3px rgba(0,0,0,0.9);
-    transition: color 0.18s ease, text-shadow 0.18s ease, transform 0.18s ease;
+    transition: color 0.18s ease, transform 0.18s ease;
   }
 
-  /* inline, so "Unit 1:" stays on the same line as its title */
+  /* inline, so "Unit 1 Models:" stays on the same line as its title */
   #units .n {
     display: inline;
     font-weight: 300;
-    color: rgba(255,255,255,0.62);
-    margin-right: 0.25em;
+    color: rgba(255,255,255,0.55);
+    margin-right: 0.3em;
   }
 
-  /* Units with no page yet: listed, dimmed, and not links. */
-  #units > .pending { color: rgba(255,255,255,0.42); cursor: default; }
+  #units > a:hover, #units > a:focus-visible {
+    color: var(--teal);
+    transform: translateX(3px);
+    outline: none;
+  }
+  #units > a:hover .n, #units > a:focus-visible .n { color: var(--blue); }
+
+  /* Units with no page yet: listed, dimmed, not links. */
+  #units > .pending { color: rgba(255,255,255,0.34); cursor: default; }
   #units > .pending .soon { font-weight: 300; font-style: italic; }
 
-  #units > a:hover, #units > a:focus-visible {
-    color: #fff;
-    text-shadow: 0 2px 14px rgba(0,0,0,0.85), 0 0 18px rgba(120,170,255,0.85);
-    transform: translateX(-3px);
-    outline: none;
+  /* Narrow or portrait: stack, logo on top. */
+  @media (max-aspect-ratio: 1/1), (max-width: 760px) {
+    body { flex-direction: column; gap: clamp(18px, 4vh, 48px); }
+    #logo { width: min(86vw, 150vh); }
+    #units { align-items: center; }
+    #units > a, #units > span { font-size: clamp(13px, 3.6vw, 30px); }
   }
 </style>
 </head>
 <body>
-<div id="stage" style="container-type: inline-size;">
-  <img id="bg" src="/images/hub-bg.jpg" alt="SSP">
+  <img id="logo" src="/images/ssp-logo.png" alt="SSP INTL">
+
   <nav id="units" aria-label="Units">
     <a href="/chem1/"><span class="n">Unit 1 Models:</span>Nuclear Interactions</a>
     <a href="/chem2/"><span class="n">Unit 2 Models:</span>Electrons and Bonds</a>
@@ -100,6 +101,5 @@
     <span class="pending"><span class="n">Unit 5 Models:</span><span class="soon">Coming soon</span></span>
     <span class="pending"><span class="n">Unit 6 Models:</span><span class="soon">Coming soon</span></span>
   </nav>
-</div>
 </body>
 </html>
