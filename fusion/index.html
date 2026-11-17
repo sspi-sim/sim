@@ -665,7 +665,7 @@
     color: #000 !important;
     text-shadow: none !important;
   }
-  body.screenshot-mode #toolbar button {
+  body.screenshot-mode #toolbar button:not(.theme-btn) {
     border-color: #000 !important;
     box-shadow: none !important;
   }
@@ -745,6 +745,21 @@
     <div id="tabBar">
       <button class="tab-btn active" id="tempTabBtn" onclick="switchTab('temp')">Temperature</button>
       <button class="tab-btn" id="fusionTabBtn" onclick="switchTab('fusion')">Fusion</button>
+    </div>
+    <!-- Version, quality, theme colours and bug report: right end of the header row -->
+    <div id="v14ColorRow" style="display:none;align-items:center;gap:10px;height:26px;margin-left:auto;">
+      <span style="font-size:10px;font-weight:600;letter-spacing:0.06em;color:rgba(255,255,255,0.45);white-space:nowrap;">Field Test Version 2.5</span>
+      <select id="qualitySelect">
+        <option value="hi-res">Hi-res</option>
+        <option value="detailed">Detailed</option>
+        <option value="simple">Simple</option>
+      </select>
+      <button class="theme-btn active" id="v14ThemeA" title="Synthwave"></button>
+      <button class="theme-btn" id="v14ThemeB" title="Industrial"></button>
+      <button class="theme-btn" id="v14ThemeC" title="Neon Blue"></button>
+      <button class="theme-btn" id="v14ThemeLight" title="Light mode"></button>
+      <input type="color" id="bgColorPicker" value="#ffffff" title="Background color">
+      <a id="bugReportBtn" title="Report a bug" style="cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;"><span class="slider-icon" style="font-size:22px;background:white;border-radius:50%;padding:2px;filter:drop-shadow(0 0 5px rgba(255,50,50,0.95)) drop-shadow(0 0 14px rgba(255,30,30,0.7)) drop-shadow(0 0 28px rgba(220,0,0,0.45));">🐞</span></a>
     </div>
     <!-- themeLight kept hidden for JS sync -->
     <button class="theme-btn" id="themeLight" title="Light mode" style="display:none;"></button>
@@ -905,21 +920,6 @@
   <canvas id="barChartCanvas"></canvas>
 </div>
 
-<!-- Theme color row — floats at top of bar chart panel (fusion tab only) -->
-<div id="v14ColorRow" style="position:fixed;right:0;top:0;width:320px;display:none;z-index:50;justify-content:center;align-items:center;gap:10px;padding:7px 0;box-sizing:border-box;background:rgba(4,3,20,0.88);border-bottom:1px solid rgba(0,180,255,0.15);">
-  <span style="font-size:10px;font-weight:600;letter-spacing:0.06em;color:rgba(255,255,255,0.45);white-space:nowrap;">Field Test Version 2.5</span>
-  <select id="qualitySelect">
-    <option value="hi-res">Hi-res</option>
-    <option value="detailed">Detailed</option>
-    <option value="simple">Simple</option>
-  </select>
-  <button class="theme-btn active" id="v14ThemeA" title="Synthwave"></button>
-  <button class="theme-btn" id="v14ThemeB" title="Industrial"></button>
-  <button class="theme-btn" id="v14ThemeC" title="Neon Blue"></button>
-  <button class="theme-btn" id="v14ThemeLight" title="Light mode"></button>
-<input type="color" id="bgColorPicker" value="#ffffff" title="Background color">
-  <a id="bugReportBtn" title="Report a bug" style="cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;"><span class="slider-icon" style="font-size:22px;background:white;border-radius:50%;padding:2px;filter:drop-shadow(0 0 5px rgba(255,50,50,0.95)) drop-shadow(0 0 14px rgba(255,30,30,0.7)) drop-shadow(0 0 28px rgba(220,0,0,0.45));">🐞</span></a>
-</div>
 
 <!-- Separate Fields panel — floats just above the scrubBar on the right side -->
 <div id="separateFieldsPanel" style="position:fixed;right:0;bottom:0;display:none;z-index:22;width:320px;height:35px;align-items:center;justify-content:center;box-sizing:border-box;">
@@ -2857,9 +2857,7 @@ function resizeBarChart() {
   const scrubH   = document.getElementById('scrubBar').offsetHeight;
   const panelH   = 35;
   const gap      = 4;
-  const colorRow = document.getElementById('v14ColorRow');
-  const colorH   = colorRow.offsetHeight || 32;
-  const topOff   = colorH;
+  const topOff   = 43;   // starts below the header's tab row
   const overlay  = document.getElementById('barChartOverlay');
   overlay.style.top    = topOff + 'px';
   overlay.style.bottom = (scrubH + panelH + gap) + 'px';
